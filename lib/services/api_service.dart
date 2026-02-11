@@ -501,6 +501,49 @@ print("------------------------locations $locationIds");
   }
 
 
+
+  // api_service.dart
+
+  // api_service.dart
+
+  // api_service.dart
+
+  Future<Map<String, dynamic>?> getSingleEmployee(String targetId) async {
+    print("🔥 API CALL: Fetching Single Employee: '$targetId'");
+
+    try {
+      var response = await http.post(
+          Uri.parse("$baseUrl/admin/employee/single"), // ✅ Naya Endpoint
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": adminToken ?? "", // Agar token chahiye to uncomment karein
+          },
+          body: jsonEncode({
+            "_id": targetId // ✅ Naya Key (_id)
+          })
+      );
+
+      print("🌐 Status: ${response.statusCode}");
+      print("---------------------------------------${targetId}");
+      print("---------------------------------------${adminToken}");
+
+      if (response.statusCode == 200) {
+        var jsonData = jsonDecode(response.body);
+
+        // ✅ Check: Ab hum List nahi, seedha Map check kar rahe hain
+        if (jsonData['success'] == true && jsonData['data'] != null) {
+          print("✅ DATA RECEIVED: ${jsonData['data']['name']}");
+          return jsonData['data']; // Seedha Object return kiya
+        }
+      }
+      print("❌ API FAILURE: ${response.body}");
+      return null;
+    } catch (e) {
+      print("⚠️ EXCEPTION: $e");
+      return null;
+    }
+  }
+
   // --- 6. MARK ATTENDANCE (Embedding + Location) ---
   Future<Map<String, dynamic>> markAttendance({
     required List<double> faceEmbedding,
@@ -711,7 +754,7 @@ print("------------------------locations $locationIds");
         }),
       );
 
-      print("📡-------------------------------------- Response Code: ${response.statusCode}");
+      print("📡-------------------------------------- monthly Response Code: ${response.statusCode}");
       print("----------------------------------------------📩 Response Body: ${response.body}"); // Debugging ke liye hata diya hai taaki console na bhare
 
         if(response.statusCode == 200) {
@@ -1156,6 +1199,7 @@ print("------------------------------------------------$locationId");
           "Authorization": "$token",
         },
         body: jsonEncode({
+
           "faceEmbedding": faceEmbedding,
           "latitude": latitude,
           "longitude": longitude,

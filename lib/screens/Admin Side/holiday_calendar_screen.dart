@@ -1,6 +1,4 @@
-import 'dart:collection';
 import 'package:flutter/material.dart';
-import 'package:table_calendar/table_calendar.dart';
 import 'package:intl/intl.dart';
 import '../../services/api_service.dart';
 
@@ -15,246 +13,290 @@ class _HolidayCalendarScreenState extends State<HolidayCalendarScreen> {
   final ApiService _apiService = ApiService();
   bool _isLoading = true;
 
-  // 🔴 CALENDAR VARIABLES
-  DateTime _focusedDay = DateTime.now();
-  DateTime? _selectedDay;
-
-  // Data Store (Key: Date, Value: List of Holiday Objects)
-  Map<DateTime, List<dynamic>> _holidaysMap = {};
-
-  // List for bottom view
-  List<dynamic> _selectedDayHolidays = [];
+  // Data Store
+  Map<String, List<dynamic>> _groupedHolidays = {};
+  int _totalHolidays = 0;
 
   @override
   void initState() {
     super.initState();
-    _selectedDay = _focusedDay;
     _fetchHolidays();
   }
 
-  // 🔴 PARSING LOGIC FOR YOUR JSON
-  void _fetchHolidays() async {
-    setState(() => _isLoading = true);
+  // 🔴 FETCH LOGIC
+  Future<void> _fetchHolidays({bool isRefresh = false}) async {
+    if (!isRefresh) setState(() => _isLoading = true);
+
     try {
-      // API Call (Returns the 'data' list from your JSON)
-      List<dynamic> data = await _apiService.getHolidays();
+      List<dynamic> rawList = await _apiService.getHolidays();
 
-      Map<DateTime, List<dynamic>> tempMap = {};
+      // Sort Date wise
+      rawList.sort((a, b) {
+        DateTime dA = DateTime.parse(a['date']);
+        DateTime dB = DateTime.parse(b['date']);
+        return dA.compareTo(dB);
+      });
 
-      for (var item in data) {
-        // JSON: "date": "2026-02-11T00:00:00.000Z"
-        String? dateStr = item['date'];
-
-        if (dateStr != null && dateStr.isNotEmpty) {
-          try {
-            // 1. String to DateTime
-            DateTime apiDate = DateTime.parse(dateStr).toLocal();
-
-            // 2. Normalize (Remove Time) - Zaroori hai Calendar ke liye
-            // Sirf Year, Month, Day rakhenge taaki match ho sake
-            DateTime dateKey = DateTime.utc(apiDate.year, apiDate.month, apiDate.day);
-
-            if (tempMap[dateKey] == null) {
-              tempMap[dateKey] = [];
-            }
-            tempMap[dateKey]!.add(item);
-          } catch (e) {
-            print("Date Parse Error: $e");
-          }
+      // Group by Month
+      Map<String, List<dynamic>> tempGroup = {};
+      for (var item in rawList) {
+        if (item['date'] != null) {
+          DateTime dt = DateTime.parse(item['date']);
+          String monthKey = DateFormat('MMMM yyyy').format(dt);
+          if (tempGroup[monthKey] == null) tempGroup[monthKey] = [];
+          tempGroup[monthKey]!.add(item);
         }
       }
 
       if (mounted) {
         setState(() {
-          _holidaysMap = tempMap;
-
-          // Auto-load data if today has holiday
-          DateTime todayKey = DateTime.utc(_focusedDay.year, _focusedDay.month, _focusedDay.day);
-          _selectedDayHolidays = _holidaysMap[todayKey] ?? [];
-
+          _groupedHolidays = tempGroup;
+          _totalHolidays = rawList.length;
           _isLoading = false;
         });
       }
     } catch (e) {
-      print("Fetch Error: $e");
       if (mounted) setState(() => _isLoading = false);
     }
   }
 
-  // 🔴 EVENT LOADER (Ye Calendar par DOTS lagata hai)
-  List<dynamic> _getHolidaysForDay(DateTime day) {
-    // Calendar jo date bhejta hai, use Normalize karke map me dhundo
-    return _holidaysMap[DateTime.utc(day.year, day.month, day.day)] ?? [];
-  }
-
   @override
   Widget build(BuildContext context) {
+    // Header Height variable taaki padding match ho sake
+    const double headerHeight = 200;
+
     return Scaffold(
       backgroundColor: const Color(0xFFF2F5F9),
       body: Stack(
         children: [
-          Column(
+          // 🔴 1. SCROLLABLE LIST (Layer 1 - Bottom)
+          // Isko humne Stack me pehle rakha taaki ye Header ke peeche chala jaye
+          RefreshIndicator(
+            onRefresh: () async => await _fetchHolidays(isRefresh: true),
+            color: const Color(0xFF2E3192),
+            edgeOffset: headerHeight + 20, // 🔥 Loader Header ke neeche dikhega
+            child: _isLoading
+                ? const Center(child: CircularProgressIndicator(color: Color(0xFF2E3192)))
+                : _groupedHolidays.isEmpty
+                ? _buildEmptyState(headerHeight) // Pass height for padding
+                : ListView.builder(
+              // 🔥 IMPORTANT: Top Padding = Header Height
+              // Isse pehla item header ke neeche dikhega,
+              // par scroll karne par header ke peeche jayega.
+              padding: const EdgeInsets.only(top: headerHeight + 10, bottom: 30),
+              physics: const AlwaysScrollableScrollPhysics(),
+              itemCount: _groupedHolidays.keys.length,
+              itemBuilder: (context, index) {
+                String monthKey = _groupedHolidays.keys.elementAt(index);
+                List<dynamic> holidaysInMonth = _groupedHolidays[monthKey]!;
+                return _buildMonthSection(monthKey, holidaysInMonth);
+              },
+            ),
+          ),
+
+          // 🔴 2. FIXED HEADER (Layer 2 - Top)
+          // Ye apni jagah se nahi hilega
+          Positioned(
+            top: 0, left: 0, right: 0,
+            height: headerHeight,
+            child: _buildFixedHeader(),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // 🔴 FIXED HEADER WIDGET
+  Widget _buildFixedHeader() {
+    return Container(
+      decoration: const BoxDecoration(
+        gradient: LinearGradient(
+          colors: [Color(0xFF2E3192), Color(0xFF00D2FF)],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
+        borderRadius: BorderRadius.only(
+          bottomLeft: Radius.circular(35),
+          bottomRight: Radius.circular(35),
+        ),
+        boxShadow: [
+          BoxShadow(color: Color(0x402E3192), blurRadius: 20, offset: Offset(0, 10))
+        ],
+      ),
+      child: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 5),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisAlignment: MainAxisAlignment.center, // Center Vertically
             children: [
-              // 🔴 HEADER (Premium Gradient)
-              Container(
-                padding: const EdgeInsets.fromLTRB(20, 60, 20, 30),
-                decoration: const BoxDecoration(
-                  gradient: LinearGradient(
-                    colors: [Color(0xFF2E3192), Color(0xFF00D2FF)],
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
+              // Top Row: Back Button
+              GestureDetector(
+                onTap: () => Navigator.pop(context),
+                child: Container(
+                  width: 40, height: 40,
+                  alignment: Alignment.center,
+                  decoration: BoxDecoration(
+                      color: Colors.white.withOpacity(0.2),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: Colors.white.withOpacity(0.3))
                   ),
-                  borderRadius: BorderRadius.only(bottomLeft: Radius.circular(35), bottomRight: Radius.circular(35)),
-                  boxShadow: [BoxShadow(color: Color(0x402E3192), blurRadius: 20, offset: Offset(0, 10))],
-                ),
-                child: Row(
-                  children: [
-                    GestureDetector(
-                      onTap: () => Navigator.pop(context),
-                      child: Container(
-                        padding: const EdgeInsets.all(10),
-                        decoration: BoxDecoration(color: Colors.white24, borderRadius: BorderRadius.circular(12)),
-                        child: const Icon(Icons.arrow_back_ios_new, color: Colors.white, size: 18),
-                      ),
-                    ),
-                    const SizedBox(width: 15),
-                    const Text("Holiday Calendar", style: TextStyle(color: Colors.white, fontSize: 22, fontWeight: FontWeight.bold)),
-                  ],
+                  child: const Icon(Icons.arrow_back_ios_new, color: Colors.white, size: 18),
                 ),
               ),
 
               const SizedBox(height: 20),
 
-              // 🔴 CALENDAR
-              Container(
-                margin: const EdgeInsets.symmetric(horizontal: 20),
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.circular(20),
-                  boxShadow: [BoxShadow(color: Colors.grey.withOpacity(0.1), blurRadius: 10, offset: const Offset(0, 5))],
+              // Title Row
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                          "Yearly Holidays",
+                          style: TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.bold)
+                      ),
+                      const SizedBox(height: 5),
+                      Text(
+                          "Total $_totalHolidays Holidays Found",
+                          style: TextStyle(color: Colors.white.withOpacity(0.85), fontSize: 14)
+                      ),
+                    ],
+                  ),
+
+                  // Decorative Icon
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(color: Colors.white.withOpacity(0.15), shape: BoxShape.circle),
+                    child: const Icon(Icons.calendar_today_rounded, color: Colors.white, size: 28),
+                  )
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // 🔴 MONTH SECTION
+  Widget _buildMonthSection(String monthName, List<dynamic> holidays) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(25, 20, 20, 10),
+          child: Row(
+            children: [
+              const Icon(Icons.calendar_month_rounded, color: Color(0xFF2E3192), size: 18),
+              const SizedBox(width: 8),
+              Text(
+                monthName.toUpperCase(),
+                style: const TextStyle(
+                    color: Color(0xFF2E3192),
+                    fontWeight: FontWeight.bold,
+                    fontSize: 14,
+                    letterSpacing: 1.2
                 ),
-                child: TableCalendar(
-                  firstDay: DateTime.utc(2020, 1, 1),
-                  lastDay: DateTime.utc(2030, 12, 31),
-                  focusedDay: _focusedDay,
+              ),
+            ],
+          ),
+        ),
+        ...holidays.map((h) => _buildModernHolidayCard(h)),
+      ],
+    );
+  }
 
-                  // Styles
-                  calendarStyle: const CalendarStyle(
-                    todayDecoration: BoxDecoration(color: Color(0xFF818CF8), shape: BoxShape.circle),
-                    selectedDecoration: BoxDecoration(color: Color(0xFF2E3192), shape: BoxShape.circle),
-                    markerDecoration: BoxDecoration(color: Colors.redAccent, shape: BoxShape.circle), // 🔴 The Dot
-                  ),
-                  headerStyle: const HeaderStyle(
-                      formatButtonVisible: false,
-                      titleCentered: true,
-                      titleTextStyle: TextStyle(fontSize: 17, fontWeight: FontWeight.bold)
-                  ),
+  // 🔴 HOLIDAY CARD
+  Widget _buildModernHolidayCard(dynamic holiday) {
+    DateTime dt = DateTime.parse(holiday['date']);
+    String dayNumber = DateFormat('dd').format(dt);
+    String dayName = DateFormat('EEEE').format(dt);
+    String title = holiday['name'] ?? "Holiday";
+    bool isPast = dt.isBefore(DateTime.now().subtract(const Duration(days: 1)));
 
-                  // Selection Logic
-                  selectedDayPredicate: (day) => isSameDay(_selectedDay, day),
-                  onDaySelected: (selectedDay, focusedDay) {
-                    setState(() {
-                      _selectedDay = selectedDay;
-                      _focusedDay = focusedDay;
-                      // Load details for selected day
-                      _selectedDayHolidays = _getHolidaysForDay(selectedDay);
-                    });
-                  },
-
-                  // 🔴 YE IMPORTANT HAI (Dots ke liye)
-                  eventLoader: _getHolidaysForDay,
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(18),
+        boxShadow: [
+          BoxShadow(color: Colors.grey.withOpacity(0.06), blurRadius: 15, offset: const Offset(0, 5))
+        ],
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(18),
+        child: IntrinsicHeight(
+          child: Row(
+            children: [
+              // Date Box
+              Container(
+                width: 80,
+                decoration: BoxDecoration(
+                    color: isPast ? Colors.grey.shade100 : const Color(0xFFF3F6FF),
+                    border: Border(right: BorderSide(color: Colors.grey.shade100))
+                ),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Text(dayNumber, style: TextStyle(fontSize: 26, fontWeight: FontWeight.bold, color: isPast ? Colors.grey : const Color(0xFF2E3192))),
+                    Text(DateFormat('MMM').format(dt).toUpperCase(), style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: isPast ? Colors.grey : Colors.blueAccent)),
+                  ],
                 ),
               ),
 
-              const SizedBox(height: 25),
-
-              // 🔴 HOLIDAY LIST SECTION
+              // Content
               Expanded(
-                child: _isLoading
-                    ? const Center(child: CircularProgressIndicator(color: Color(0xFF2E3192)))
-                    : Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 20),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 15),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisAlignment: MainAxisAlignment.center,
                     children: [
-                      Text(
-                        _selectedDay != null
-                            ? DateFormat('EEEE, d MMMM yyyy').format(_selectedDay!)
-                            : "Select a date",
-                        style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.grey[600], letterSpacing: 1),
+                      Text(title, style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: isPast ? Colors.grey.shade600 : const Color(0xFF2D3142))),
+                      const SizedBox(height: 4),
+                      Row(
+                        children: [
+                          Icon(Icons.access_time_filled, size: 12, color: isPast ? Colors.grey : Colors.orange),
+                          const SizedBox(width: 5),
+                          Text(dayName, style: TextStyle(fontSize: 13, color: Colors.grey.shade500, fontWeight: FontWeight.w500)),
+                        ],
                       ),
-                      const SizedBox(height: 15),
-
-                      if (_selectedDayHolidays.isEmpty)
-                        Expanded(child: _buildEmptyState())
-                      else
-                        Expanded(
-                          child: ListView.builder(
-                            itemCount: _selectedDayHolidays.length,
-                            itemBuilder: (context, index) {
-                              var holiday = _selectedDayHolidays[index];
-                              return _buildHolidayCard(holiday);
-                            },
-                          ),
-                        )
                     ],
                   ),
                 ),
-              )
+              ),
+
+              if (!isPast) Container(width: 4, color: const Color(0xFF00D2FF)),
             ],
           ),
-        ],
+        ),
       ),
     );
   }
 
-  // 🔴 CARD: Shows "New Year" & "Hello"
-  Widget _buildHolidayCard(dynamic holiday) {
-    String name = holiday['name'] ?? "Holiday";
-    String description = holiday['description'] ?? "No description";
-
-    return Container(
-      margin: const EdgeInsets.only(bottom: 15),
-      padding: const EdgeInsets.all(20),
-      decoration: BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.circular(16),
-          border: Border(left: BorderSide(color: Colors.redAccent.withOpacity(0.8), width: 5)),
-          boxShadow: [BoxShadow(color: Colors.grey.withOpacity(0.08), blurRadius: 10, offset: const Offset(0, 4))]
-      ),
-      child: Row(
-        children: [
-          Container(
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(color: Colors.redAccent.withOpacity(0.1), shape: BoxShape.circle),
-            child: const Icon(Icons.celebration_rounded, color: Colors.redAccent, size: 24),
+  // 🔴 EMPTY STATE (Scrollable to allow refresh)
+  Widget _buildEmptyState(double topPadding) {
+    return ListView(
+      physics: const AlwaysScrollableScrollPhysics(),
+      padding: EdgeInsets.only(top: topPadding),
+      children: [
+        SizedBox(height: MediaQuery.of(context).size.height * 0.2),
+        Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(Icons.beach_access_rounded, size: 80, color: Colors.blue.shade100),
+              const SizedBox(height: 20),
+              Text("No Holidays Found", style: TextStyle(fontSize: 18, color: Colors.grey.shade600, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 5),
+              const Text("Pull down to refresh", style: TextStyle(color: Colors.grey)),
+            ],
           ),
-          const SizedBox(width: 15),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(name, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF1E293B))),
-                const SizedBox(height: 5),
-                Text(description, style: TextStyle(color: Colors.grey.shade500, fontSize: 13, height: 1.3)),
-              ],
-            ),
-          )
-        ],
-      ),
-    );
-  }
-
-  Widget _buildEmptyState() {
-    return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Icon(Icons.event_note_rounded, size: 60, color: Colors.grey.shade200),
-          const SizedBox(height: 15),
-          Text("No Holiday on this date", style: TextStyle(color: Colors.grey.shade400, fontWeight: FontWeight.w600)),
-        ],
-      ),
+        ),
+      ],
     );
   }
 }

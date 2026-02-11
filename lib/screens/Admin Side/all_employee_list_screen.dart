@@ -1,5 +1,6 @@
 import 'dart:io';
 import 'dart:typed_data';
+import 'package:face_attendance/screens/Admin%20Side/employee_details_screen.dart';
 import 'package:http/http.dart' as http;
 import 'package:flutter/material.dart';
 
@@ -285,11 +286,10 @@ class _EmployeeListScreenState extends State<EmployeeListScreen> {
           borderRadius: BorderRadius.circular(24),
           onTap: () {
             // Passing Correct Location ID
-            Navigator.push(context, MaterialPageRoute(builder: (context) => AttendanceHistoryScreen(
-                employeeName: name,
+            Navigator.push(context, MaterialPageRoute(builder: (context) => EmployeeDetailScreen(
+
                 employeeId: empId,
-                locationId: locationId,
-                departmentId: departmentId,
+
             )));
           },
           child: Padding(
