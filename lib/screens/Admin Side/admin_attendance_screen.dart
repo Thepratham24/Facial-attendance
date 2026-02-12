@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 import 'package:camera/camera.dart';
-import 'package:face_attendance/screens/Admin%20Side/admin_dashboard_screen.dart';
+import 'package:flutter/foundation.dart'; // WriteBuffer
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
@@ -26,69 +26,85 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Widg
   final ApiService _apiService = ApiService();
 
   CameraController? _controller;
-  FaceDetector? _faceDetector;
+  CameraDescription? _cameraDescription;
+  late FaceDetector _faceDetector;
   List<Face> _faces = [];
 
-  // 🔴 LOCKS FOR SMOOTH FLOW
-  bool _isBusy = false;       // Processing Lock
-  bool _isNavigating = false; // Navigation Lock
-  DateTime _lastScanTime = DateTime.now(); // 1.5 Sec Throttle
-
-  // Toggle
+  bool _isNavigating = false;
+  bool _isDetecting = false;
+  bool _isProcessing = false;
+  bool _canScan = false;
   bool _isForceCheckout = false;
+
+  // 🔴 FAST PERFORMANCE FIX: Time Tracker
+  DateTime _lastScanTime = DateTime(0);
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _faceDetector = FaceDetector(options: FaceDetectorOptions(performanceMode: FaceDetectorMode.fast));
-    _startCamera();
+
+    _faceDetector = FaceDetector(options: FaceDetectorOptions(
+        performanceMode: FaceDetectorMode.fast, // Keep it fast
+        enableContours: false,
+        enableClassification: false
+    ));
+
+    _initializeCamera();
+
+    Future.delayed(const Duration(seconds: 2), () {
+      if (mounted) setState(() => _canScan = true);
+    });
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (_controller == null || !_controller!.value.isInitialized) return;
+
     if (state == AppLifecycleState.inactive || state == AppLifecycleState.paused) {
-      _stopCamera();
-    } else if (state == AppLifecycleState.resumed) {
-      if (!_isNavigating) {
-        _startCamera();
-      }
+      if (mounted) setState(() => _controller = null);
+      _controller?.dispose();
+    }
+    else if (state == AppLifecycleState.resumed) {
+      _initializeCamera();
     }
   }
 
-  // 🔴 1. START CAMERA
-  Future<void> _startCamera() async {
+  void _initializeCamera() async {
     if (cameras.isEmpty) return;
 
-    await _stopCamera(); // Clean old
-
-    CameraDescription selectedCamera = cameras[0];
-    for (var camera in cameras) {
-      if (camera.lensDirection == CameraLensDirection.front) {
-        selectedCamera = camera;
-        break;
-      }
+    if (_controller != null) {
+      await _controller?.dispose();
     }
 
-    final CameraController newController = CameraController(
-      selectedCamera,
+    _cameraDescription = cameras.firstWhere(
+          (camera) => camera.lensDirection == CameraLensDirection.front,
+      orElse: () => cameras.first,
+    );
+
+    _controller = CameraController(
+      _cameraDescription!,
       ResolutionPreset.medium,
       enableAudio: false,
       imageFormatGroup: Platform.isAndroid ? ImageFormatGroup.nv21 : ImageFormatGroup.bgra8888,
     );
 
     try {
-      await newController.initialize();
+      await _controller!.initialize();
       if (!mounted) return;
+      setState(() {});
 
-      setState(() => _controller = newController);
+      _controller!.startImageStream((image) {
+        // 🔴 🔴 PERFORMANCE FIX: THROTTLING 🔴 🔴
+        // Check if 800 milliseconds have passed since last scan
+        // Isse GC load 90% kam ho jayega
+        if (DateTime.now().difference(_lastScanTime).inMilliseconds < 800) {
+          return; // Skip this frame
+        }
 
-      newController.startImageStream((image) {
-        if (_isNavigating || _isBusy) return;
-
-        // 1.5 Second Throttle
-        if (DateTime.now().difference(_lastScanTime).inMilliseconds > 1500) {
-          _processFrame(image);
+        if (_canScan && !_isDetecting && !_isNavigating && !_isProcessing) {
+          _lastScanTime = DateTime.now(); // Update time
+          _doFaceDetection(image);
         }
       });
     } catch (e) {
@@ -96,175 +112,147 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Widg
     }
   }
 
-  // 🔴 2. STOP CAMERA
   Future<void> _stopCamera() async {
-    final CameraController? tempController = _controller;
-
-    if (mounted) {
-      setState(() {
-        _controller = null;
-      });
-    }
-
-    if (tempController != null) {
-      try {
-        await tempController.stopImageStream();
-        await tempController.dispose();
-      } catch (_) {}
-    }
-  }
-
-  // 🔴 3. MAIN LOGIC (STRICT SUCCESS CHECK)
-  Future<void> _processFrame(CameraImage image) async {
-    _isBusy = true; // Lock
-    _lastScanTime = DateTime.now();
+    if (_controller == null) return;
+    final oldController = _controller;
+    _controller = null;
+    if (mounted) setState(() {});
 
     try {
-      // A. Input
-      final inputImage = _convertCameraImage(image);
-      if (inputImage == null) return;
+      await oldController!.stopImageStream();
+      await oldController.dispose();
+    } catch (e) {}
+  }
 
-      // B. Detect
-      if (_faceDetector == null) return;
-      final faces = await _faceDetector!.processImage(inputImage);
+  Future<void> _doFaceDetection(CameraImage image) async {
+    // Double check locks
+    if (_isDetecting || _isNavigating || !mounted) return;
+    _isDetecting = true;
 
-      if (mounted) setState(() => _faces = faces);
-
-      if (faces.isEmpty) return;
-
-      // --- FACE FOUND ---
-
-      // C. Net Check
-      try {
-        final result = await InternetAddress.lookup('google.com');
-        if (result.isEmpty || result[0].rawAddress.isEmpty) throw SocketException("No Net");
-      } on SocketException {
-        if(mounted) _showTopNotification("No Internet Connection", true);
+    try {
+      final inputImage = _inputImageFromCameraImage(image);
+      if (inputImage == null) {
+        _isDetecting = false;
         return;
       }
 
-      // D. Embedding & Location
+      final faces = await _faceDetector.processImage(inputImage);
+      if (mounted) setState(() => _faces = faces);
+
+      if (faces.isEmpty) {
+        _isDetecting = false;
+        return;
+      }
+
+      // Face Detected -> Start Process
+      if (mounted && !_isProcessing) {
+        setState(() => _isProcessing = true);
+      }
+
       List<double> embedding = await _mlService.getEmbedding(image, faces[0]);
-      Position pos = await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.medium);
+      Position pos = await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.high);
 
-      // E. API CALL (Toggle Logic)
+      // 🔴 Current Device Time
+      String currentTime = DateTime.now().toIso8601String();
+
       Map<String, dynamic> result;
-
       if (_isForceCheckout) {
-        // Force Out API
         result = await _apiService.forceCheckOut(
           faceEmbedding: embedding,
           latitude: pos.latitude,
           longitude: pos.longitude,
           isFromAdminPhone: true,
+          deviceDate: currentTime,
         );
       } else {
-        // Normal Attendance API
         result = await _apiService.markAttendance(
           faceEmbedding: embedding,
           latitude: pos.latitude,
           longitude: pos.longitude,
           isFromAdminPhone: true,
+          deviceDate: currentTime,
         );
       }
 
-      // F. STRICT HANDLING
       bool isSuccess = result['success'] == true;
-      String message = result['message'] ?? "Processing...";
+      String backendMessage = result['message'] ?? "Unknown Response";
 
       if (isSuccess) {
-        // ✅ SUCCESS CASE
-        _isNavigating = true; // Lock Navigation
-
-        // 🔴 Extract Correct Name (Force Out structure handled)
-        String finalName = _getSafeName(result);
-
+        _isNavigating = true;
         await _stopCamera();
 
-        if (!mounted) return;
-
-        // Navigate
-        await Navigator.pushReplacement(
-          context,
-          MaterialPageRoute(builder: (context) => ResultScreen(
-              name: finalName,
-              imagePath: "",
-              punchStatus: message,
-              punchTime: DateFormat('hh:mm a').format(DateTime.now())
-          )),
-        );
+        String finalName = _getSafeName(result);
 
         if (mounted) {
-          _isNavigating = false;
-          _startCamera();
+          await Navigator.pushReplacement(
+              context,
+              MaterialPageRoute(builder: (context) => ResultScreen(
+                  name: finalName,
+                  imagePath: "",
+                  punchStatus: backendMessage,
+                  punchTime: DateFormat('hh:mm a').format(DateTime.now())
+              ))
+          );
         }
-
       } else {
-        // ❌ FAILURE CASE (Face Not Matched)
-        // Camera chalta rahega, Result Screen nahi khulegi
-        if(mounted) _showTopNotification(message, true);
+        if (mounted) _showTopNotification(backendMessage, true);
+
+        // 🔴 Wait before unlocking (Memory cleanup time)
+        await Future.delayed(const Duration(seconds: 2));
+
+        if (mounted) setState(() {
+          _isProcessing = false;
+          _isDetecting = false;
+        });
       }
 
     } catch (e) {
-      print("Process Error: $e");
+      debugPrint("Error: $e");
+      if (mounted) setState(() => _isProcessing = false);
     } finally {
-      // 🔓 Unlock for next scan (Only if not navigating)
-      if (!_isNavigating && mounted) {
-        setState(() {
-          _isBusy = false;
-        });
-      }
+      if (mounted && !_isNavigating && !_isProcessing) _isDetecting = false;
     }
   }
 
-  // 🔴 4. NAME PARSER (Based on your JSON)
   String _getSafeName(Map<String, dynamic> response) {
     try {
       var data = response['data'];
       if (data == null) return "Verified User";
-
-      // 1. Force Checkout Structure: data -> employee -> name
       if (data['employee'] != null && data['employee'] is Map) {
-        if (data['employee']['name'] != null) return data['employee']['name'];
+        return data['employee']['name'] ?? "Verified User";
       }
-
-      // 2. Normal Attendance Structure (Direct)
       if (data['name'] != null) return data['name'];
-
-      // 3. Record Structure
       if (data['record'] != null && data['record']['employeeId'] != null) {
         var emp = data['record']['employeeId'];
-        if (emp is Map && emp['name'] != null) return emp['name'];
+        if (emp is Map) return emp['name'] ?? "Verified User";
       }
-
       return "Verified User";
-    } catch (e) {
-      return "Verified User";
-    }
+    } catch (_) { return "Verified User"; }
   }
 
-  InputImage? _convertCameraImage(CameraImage image) {
-    if (_controller == null) return null;
-    try {
-      final camera = _controller!.description;
-      final sensorOrientation = camera.sensorOrientation;
-      InputImageRotation rotation = InputImageRotation.rotation0deg;
+  InputImage? _inputImageFromCameraImage(CameraImage image) {
+    if (_controller == null || _cameraDescription == null) return null;
 
-      if (Platform.isAndroid) {
-        var rotationCompensation = (sensorOrientation + 0) % 360;
-        rotation = InputImageRotationValue.fromRawValue(rotationCompensation) ?? InputImageRotation.rotation270deg;
-      }
+    final rotation = InputImageRotationValue.fromRawValue(_cameraDescription!.sensorOrientation);
+    if (rotation == null) return null;
 
-      return InputImage.fromBytes(
-          bytes: _mlService.concatenatePlanes(image.planes),
-          metadata: InputImageMetadata(
-              size: Size(image.width.toDouble(), image.height.toDouble()),
-              rotation: rotation,
-              format: Platform.isAndroid ? InputImageFormat.nv21 : InputImageFormat.bgra8888,
-              bytesPerRow: image.planes[0].bytesPerRow
-          )
-      );
-    } catch (_) { return null; }
+    final format = InputImageFormatValue.fromRawValue(image.format.raw);
+    if (format == null || (Platform.isAndroid && format != InputImageFormat.nv21)) return null;
+
+    final WriteBuffer allBytes = WriteBuffer();
+    for (final Plane plane in image.planes) {
+      allBytes.putUint8List(plane.bytes);
+    }
+    final bytes = allBytes.done().buffer.asUint8List();
+
+    final metadata = InputImageMetadata(
+      size: Size(image.width.toDouble(), image.height.toDouble()),
+      rotation: rotation,
+      format: format,
+      bytesPerRow: image.planes[0].bytesPerRow,
+    );
+
+    return InputImage.fromBytes(bytes: bytes, metadata: metadata);
   }
 
   @override
@@ -279,30 +267,20 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Widg
         backgroundColor: Colors.black,
         body: Stack(
           children: [
-            // CAMERA
-            if (_controller != null && _controller!.value.isInitialized)
+            if (_controller != null && _controller!.value.isInitialized && !_isNavigating)
               SizedBox.expand(
                 child: FittedBox(
                   fit: BoxFit.cover,
                   child: SizedBox(
                     width: _controller!.value.previewSize!.height,
                     height: _controller!.value.previewSize!.width,
-                    child: CameraPreview(
-                        _controller!,
-                        child: CustomPaint(
-                            painter: FacePainter(
-                                faces: _faces,
-                                imageSize: _controller!.value.previewSize!
-                            )
-                        )
-                    ),
+                    child: CameraPreview(_controller!, child: CustomPaint(painter: FacePainter(faces: _faces, imageSize: _controller!.value.previewSize!))),
                   ),
                 ),
               )
             else
               const Center(child: CircularProgressIndicator(color: Colors.white)),
 
-            // BACK BUTTON
             Positioned(
               top: 50, left: 20,
               child: IconButton(
@@ -312,73 +290,40 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Widg
               ),
             ),
 
-            // 🔴 TOGGLE (Right Side)
             Positioned(
               top: 50, right: 20,
               child: Container(
                 padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-                decoration: BoxDecoration(
-                  color: Colors.black54,
-                  borderRadius: BorderRadius.circular(30),
-                  border: _isForceCheckout ? Border.all(color: Colors.redAccent, width: 2) : null,
-                ),
+                decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(30), border: _isForceCheckout ? Border.all(color: Colors.redAccent, width: 2) : null),
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    Text(
-                      "Force Out",
-                      style: TextStyle(
-                          color: _isForceCheckout ? Colors.redAccent : Colors.white,
-                          fontWeight: FontWeight.bold,
-                          fontSize: 12
-                      ),
-                    ),
+                    Text("Force Out", style: TextStyle(color: _isForceCheckout ? Colors.redAccent : Colors.white, fontWeight: FontWeight.bold, fontSize: 12)),
                     const SizedBox(width: 5),
-                    Transform.scale(
-                      scale: 0.8,
-                      child: Switch(
-                        value: _isForceCheckout,
-                        activeColor: Colors.red,
-                        activeTrackColor: Colors.red.withOpacity(0.3),
-                        inactiveThumbColor: Colors.white,
-                        inactiveTrackColor: Colors.grey,
-                        onChanged: (val) {
-                          setState(() => _isForceCheckout = val);
-                        },
-                      ),
-                    ),
+                    Transform.scale(scale: 0.8, child: Switch(value: _isForceCheckout, activeColor: Colors.red, onChanged: (v) => setState(() => _isForceCheckout = v))),
                   ],
                 ),
               ),
             ),
 
-            // BOTTOM BAR
             Positioned(
               bottom: 0, left: 0, right: 0,
               child: Container(
                 padding: const EdgeInsets.fromLTRB(20, 30, 20, 40),
-                decoration: BoxDecoration(
-                    color: _isForceCheckout
-                        ? Colors.red.withOpacity(0.8)
-                        : Colors.black.withOpacity(0.7),
-                    borderRadius: const BorderRadius.vertical(top: Radius.circular(30))
-                ),
+                decoration: BoxDecoration(color: _isForceCheckout ? Colors.red.withOpacity(0.8) : Colors.black.withOpacity(0.7), borderRadius: const BorderRadius.vertical(top: Radius.circular(30))),
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    Icon(_isForceCheckout ? Icons.logout : Icons.face, color: Colors.white, size: 40),
+                    _isProcessing
+                        ? const SizedBox(height: 30, width: 30, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 3))
+                        : Icon(_isForceCheckout ? Icons.logout : Icons.face, color: Colors.white, size: 40),
                     const SizedBox(height: 15),
                     Text(
-                      _isBusy ? "Processing..." : (_isForceCheckout ? "FORCE CHECK-OUT MODE" : "Face Recognition Active"),
+                      _isProcessing ? "Processing..." : (_isForceCheckout ? "FORCE CHECK-OUT MODE" : "Face Recognition Active"),
                       style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
                     ),
                     const SizedBox(height: 5),
-                    Text(
-                        _isForceCheckout
-                            ? "Caution: This will force mark attendance as OUT"
-                            : "Attendance will be marked for the detected face",
-                        style: const TextStyle(color: Colors.white70, fontSize: 12)
-                    ),
+                    Text(_faces.isEmpty ? "Align face in center" : "Face Detected!", style: TextStyle(color: _faces.isEmpty ? Colors.white54 : Colors.greenAccent, fontSize: 12)),
                   ],
                 ),
               ),
@@ -389,28 +334,16 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Widg
     );
   }
 
-  // 🔴 NOTIFICATION (Below Toggle)
   void _showTopNotification(String m, bool err) {
     if (!mounted) return;
     OverlayEntry entry = OverlayEntry(builder: (c) => Positioned(
-        top: 130, // 👈 Clear of Toggle
-        left: 20, right: 20,
+        top: 130, left: 20, right: 20,
         child: Material(
             color: Colors.transparent,
             child: Container(
                 padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                decoration: BoxDecoration(
-                    color: err ? Colors.redAccent.withOpacity(0.9) : Colors.green.withOpacity(0.9),
-                    borderRadius: BorderRadius.circular(30),
-                    boxShadow: [BoxShadow(color: Colors.black26, blurRadius: 10)]
-                ),
-                child: Row(
-                  children: [
-                    Icon(err ? Icons.error_outline : Icons.check_circle, color: Colors.white),
-                    const SizedBox(width: 10),
-                    Expanded(child: Text(m, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold), maxLines: 2, overflow: TextOverflow.ellipsis)),
-                  ],
-                )
+                decoration: BoxDecoration(color: err ? Colors.redAccent : Colors.green, borderRadius: BorderRadius.circular(30)),
+                child: Row(children: [Icon(err ? Icons.error_outline : Icons.check_circle, color: Colors.white), const SizedBox(width: 10), Expanded(child: Text(m, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)))])
             )
         )
     ));
@@ -421,8 +354,10 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Widg
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _controller?.dispose();
-    _faceDetector?.close();
+    final camera = _controller;
+    _controller = null;
+    if (camera != null) camera.dispose();
+    _faceDetector.close();
     super.dispose();
   }
 }
@@ -445,18 +380,27 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Widg
 
 
 
-
-
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
 // import 'dart:async';
 // import 'dart:io';
 // import 'package:camera/camera.dart';
-// import 'package:face_attendance/screens/Admin%20Side/admin_dashboard_screen.dart';
+// import 'package:flutter/foundation.dart'; // WriteBuffer
 // import 'package:flutter/material.dart';
 // import 'package:geolocator/geolocator.dart';
 // import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 // import 'package:intl/intl.dart';
 // import 'dart:ui';
-// import 'package:shared_preferences/shared_preferences.dart';
 //
 // import '../../main.dart';
 // import '../../services/api_service.dart';
@@ -476,43 +420,46 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Widg
 //   final ApiService _apiService = ApiService();
 //
 //   CameraController? _controller;
+//   CameraDescription? _cameraDescription;
 //   late FaceDetector _faceDetector;
 //   List<Face> _faces = [];
 //
 //   bool _isNavigating = false;
-//   bool _isDetecting = false;
-//   bool _isProcessing = false;
-//   bool _canScan = false;
 //
-//   // 🔴 NEW FLAG FOR FORCE CHECKOUT
+//   // 🔴 1. STRICT LOCK VARIABLE (Ye camera ko atakne se rokega)
+//   bool _isBusy = false;
+//
 //   bool _isForceCheckout = false;
+//   bool _canScan = false;
 //
 //   @override
 //   void initState() {
 //     super.initState();
 //     WidgetsBinding.instance.addObserver(this);
-//     _faceDetector = FaceDetector(options: FaceDetectorOptions(performanceMode: FaceDetectorMode.fast));
+//
+//     _faceDetector = FaceDetector(options: FaceDetectorOptions(
+//         performanceMode: FaceDetectorMode.fast,
+//         enableContours: false,
+//         enableClassification: false
+//     ));
 //
 //     _initializeCamera();
 //
-//     // Thoda delay taaki camera settle ho jaye
+//     // 2 second delay to settle camera
 //     Future.delayed(const Duration(seconds: 2), () {
 //       if (mounted) setState(() => _canScan = true);
 //     });
 //   }
 //
-//   // 🔴 LIFECYCLE HANDLE
 //   @override
 //   void didChangeAppLifecycleState(AppLifecycleState state) {
-//     final CameraController? cameraController = _controller;
+//     if (_controller == null || !_controller!.value.isInitialized) return;
 //
-//     if (cameraController == null || !cameraController.value.isInitialized) {
-//       return;
-//     }
-//
-//     if (state == AppLifecycleState.inactive) {
-//       _stopCamera();
+//     if (state == AppLifecycleState.inactive || state == AppLifecycleState.paused) {
+//       // Background me gaya to camera band
+//       _controller?.dispose();
 //     } else if (state == AppLifecycleState.resumed) {
+//       // Wapis aaya to camera chalu
 //       _initializeCamera();
 //     }
 //   }
@@ -520,118 +467,102 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Widg
 //   void _initializeCamera() async {
 //     if (cameras.isEmpty) return;
 //
+//     // Purana controller dispose karo
 //     if (_controller != null) {
-//       await _stopCamera();
+//       await _controller?.dispose();
 //     }
 //
-//     CameraDescription selectedCamera = cameras[0];
-//     for (var camera in cameras) {
-//       if (camera.lensDirection == CameraLensDirection.front) {
-//         selectedCamera = camera;
-//         break;
-//       }
-//     }
+//     _cameraDescription = cameras.firstWhere(
+//           (camera) => camera.lensDirection == CameraLensDirection.front,
+//       orElse: () => cameras.first,
+//     );
 //
-//     CameraController newController = CameraController(
-//       selectedCamera,
+//     _controller = CameraController(
+//       _cameraDescription!,
 //       ResolutionPreset.medium,
 //       enableAudio: false,
 //       imageFormatGroup: Platform.isAndroid ? ImageFormatGroup.nv21 : ImageFormatGroup.bgra8888,
 //     );
 //
 //     try {
-//       await newController.initialize();
+//       await _controller!.initialize();
 //       if (!mounted) return;
+//       setState(() {});
 //
-//       setState(() => _controller = newController);
+//       _controller!.startImageStream((image) async {
+//         // 🔴 2. BUFFER FIX LOGIC
+//         // Agar pehle se busy hai, to is frame ko ignore karo (Drop Frame)
+//         if (_isBusy || !_canScan || _isNavigating) return;
 //
-//       newController.startImageStream((image) {
-//         if (_canScan && !_isDetecting && !_isNavigating && !_isProcessing) {
-//           _doFaceDetection(image);
+//         _isBusy = true; // Taala lagao
+//
+//         try {
+//           await _doFaceDetection(image);
+//         } catch (e) {
+//           debugPrint("Stream Error: $e");
+//         } finally {
+//           _isBusy = false; // Taala kholo (Chahe success ho ya fail)
 //         }
 //       });
 //     } catch (e) {
-//       debugPrint("Camera Init Error: $e");
+//       debugPrint("Camera Error: $e");
 //     }
 //   }
 //
 //   Future<void> _stopCamera() async {
+//     if (_controller == null) return;
 //     final oldController = _controller;
+//     _controller = null;
+//     if (mounted) setState(() {});
 //
-//     if (mounted) {
-//       setState(() {
-//         _controller = null;
-//       });
-//     }
-//
-//     if (oldController != null) {
-//       try {
-//         if (oldController.value.isStreamingImages) {
-//           await oldController.stopImageStream();
-//         }
-//         await oldController.dispose();
-//       } catch (e) {
-//         debugPrint("Dispose Error: $e");
-//       }
-//     }
+//     try {
+//       await oldController!.stopImageStream();
+//       await oldController.dispose();
+//     } catch (e) {}
 //   }
 //
 //   Future<void> _doFaceDetection(CameraImage image) async {
-//     if (_isDetecting || _isNavigating || !mounted) return;
-//     _isDetecting = true;
+//     // Basic check
+//     if (_isNavigating || !mounted) return;
 //
 //     try {
-//       final inputImage = _convertCameraImage(image);
+//       final inputImage = _inputImageFromCameraImage(image);
 //       if (inputImage == null) return;
 //
 //       final faces = await _faceDetector.processImage(inputImage);
 //       if (mounted) setState(() => _faces = faces);
 //
-//       if (faces.isEmpty) {
-//         _isDetecting = false;
-//         return;
-//       }
+//       // Agar chehra nahi mila, to wapis jao
+//       if (faces.isEmpty) return;
 //
-//       // Internet Check
-//       try {
-//         final result = await InternetAddress.lookup('google.com');
-//         if (result.isEmpty || result[0].rawAddress.isEmpty) {
-//           throw SocketException("No Internet");
-//         }
-//       } on SocketException {
-//         if (mounted && !_isNavigating) {
-//           _showTopNotification("No Internet Connection", true);
-//         }
-//         _isDetecting = false;
-//         return;
-//       }
+//       // --- FACE MIL GYA ---
 //
-//       if (mounted && !_isProcessing) {
-//         setState(() => _isProcessing = true);
-//       }
-//
+//       // Embedding nikalo
 //       List<double> embedding = await _mlService.getEmbedding(image, faces[0]);
+//
+//       // Location nikalo
 //       Position pos = await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.high);
 //
-//       // 🔴🔴🔴 LOGIC CHANGED HERE FOR FLAG 🔴🔴🔴
-//       Map<String, dynamic> result;
+//       // Current Time
+//       String currentTime = DateTime.now().toIso8601String();
 //
+//       // API Call
+//       Map<String, dynamic> result;
 //       if (_isForceCheckout) {
-//         // CALL FORCE CHECKOUT API
-//         print("🚀 Calling Force CheckOut API...");
 //         result = await _apiService.forceCheckOut(
 //           faceEmbedding: embedding,
 //           latitude: pos.latitude,
 //           longitude: pos.longitude,
 //           isFromAdminPhone: true,
+//           deviceTime: currentTime,
 //         );
 //       } else {
-//         // NORMAL ATTENDANCE
 //         result = await _apiService.markAttendance(
 //           faceEmbedding: embedding,
 //           latitude: pos.latitude,
 //           longitude: pos.longitude,
 //           isFromAdminPhone: true,
+//           deviceTime: currentTime,
 //         );
 //       }
 //
@@ -639,82 +570,77 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Widg
 //       String backendMessage = result['message'] ?? "Unknown Response";
 //
 //       if (isSuccess) {
+//         // ✅ Success: Navigation Lock lagao
 //         _isNavigating = true;
+//
+//         // Camera band karo
 //         await _stopCamera();
 //
-//         String detectedName = "Employee";
-//         if (result['data'] != null) {
-//           var data = result['data'];
-//           var empData = data['employee'] ?? data; // Handle structure variations
-//           detectedName = empData['name'] ?? "Employee";
-//         }
-//
-//         if (!mounted) return;
-//
-//         // Result Screen
-//         await Navigator.pushReplacement(
-//           context,
-//           MaterialPageRoute(builder: (context) => ResultScreen(
-//               name: detectedName,
-//               imagePath: "",
-//               punchStatus: backendMessage, // Backend Message Displayed
-//               punchTime: DateFormat('hh:mm a').format(DateTime.now())
-//           )),
-//         );
+//         String finalName = _getSafeName(result);
 //
 //         if (mounted) {
-//           Navigator.pushAndRemoveUntil(
+//           await Navigator.pushReplacement(
 //               context,
-//               MaterialPageRoute(builder: (c) => const AdminDashboard()),
-//                   (route) => false
+//               MaterialPageRoute(builder: (context) => ResultScreen(
+//                   name: finalName,
+//                   imagePath: "",
+//                   punchStatus: backendMessage,
+//                   punchTime: DateFormat('hh:mm a').format(DateTime.now())
+//               ))
 //           );
 //         }
-//
 //       } else {
+//         // ❌ Fail: Toast dikhao
 //         if (mounted) _showTopNotification(backendMessage, true);
 //
+//         // 🔴 Wait: Taaki user message padh sake aur system saans le sake
 //         await Future.delayed(const Duration(seconds: 2));
-//
-//         if (mounted) {
-//           setState(() {
-//             _isProcessing = false;
-//             _isDetecting = false;
-//           });
-//         }
 //       }
+//
 //     } catch (e) {
 //       debugPrint("Error: $e");
-//       if (mounted) {
-//         setState(() => _isProcessing = false);
-//         _showTopNotification("Scan Failed. Try Again.", true);
-//       }
-//     } finally {
-//       if (mounted && !_isNavigating && !_isProcessing) _isDetecting = false;
 //     }
 //   }
 //
-//   InputImage? _convertCameraImage(CameraImage image) {
-//     if (_controller == null) return null;
+//   String _getSafeName(Map<String, dynamic> response) {
 //     try {
-//       final camera = _controller!.description;
-//       final sensorOrientation = camera.sensorOrientation;
-//       InputImageRotation rotation = InputImageRotation.rotation0deg;
-//
-//       if (Platform.isAndroid) {
-//         var rotationCompensation = (sensorOrientation + 0) % 360;
-//         rotation = InputImageRotationValue.fromRawValue(rotationCompensation) ?? InputImageRotation.rotation270deg;
+//       var data = response['data'];
+//       if (data == null) return "Verified User";
+//       if (data['employee'] != null && data['employee'] is Map) {
+//         return data['employee']['name'] ?? "Verified User";
 //       }
+//       if (data['name'] != null) return data['name'];
+//       if (data['record'] != null && data['record']['employeeId'] != null) {
+//         var emp = data['record']['employeeId'];
+//         if (emp is Map) return emp['name'] ?? "Verified User";
+//       }
+//       return "Verified User";
+//     } catch (_) { return "Verified User"; }
+//   }
 //
-//       return InputImage.fromBytes(
-//           bytes: _mlService.concatenatePlanes(image.planes),
-//           metadata: InputImageMetadata(
-//               size: Size(image.width.toDouble(), image.height.toDouble()),
-//               rotation: rotation,
-//               format: Platform.isAndroid ? InputImageFormat.nv21 : InputImageFormat.bgra8888,
-//               bytesPerRow: image.planes[0].bytesPerRow
-//           )
-//       );
-//     } catch (_) { return null; }
+//   InputImage? _inputImageFromCameraImage(CameraImage image) {
+//     if (_controller == null || _cameraDescription == null) return null;
+//
+//     final rotation = InputImageRotationValue.fromRawValue(_cameraDescription!.sensorOrientation);
+//     if (rotation == null) return null;
+//
+//     final format = InputImageFormatValue.fromRawValue(image.format.raw);
+//     if (format == null || (Platform.isAndroid && format != InputImageFormat.nv21)) return null;
+//
+//     final WriteBuffer allBytes = WriteBuffer();
+//     for (final Plane plane in image.planes) {
+//       allBytes.putUint8List(plane.bytes);
+//     }
+//     final bytes = allBytes.done().buffer.asUint8List();
+//
+//     final metadata = InputImageMetadata(
+//       size: Size(image.width.toDouble(), image.height.toDouble()),
+//       rotation: rotation,
+//       format: format,
+//       bytesPerRow: image.planes[0].bytesPerRow,
+//     );
+//
+//     return InputImage.fromBytes(bytes: bytes, metadata: metadata);
 //   }
 //
 //   @override
@@ -729,6 +655,7 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Widg
 //         backgroundColor: Colors.black,
 //         body: Stack(
 //           children: [
+//             // Camera
 //             if (_controller != null && _controller!.value.isInitialized && !_isNavigating)
 //               SizedBox.expand(
 //                 child: FittedBox(
@@ -736,22 +663,14 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Widg
 //                   child: SizedBox(
 //                     width: _controller!.value.previewSize!.height,
 //                     height: _controller!.value.previewSize!.width,
-//                     child: CameraPreview(
-//                         _controller!,
-//                         child: CustomPaint(
-//                             painter: FacePainter(
-//                                 faces: _faces,
-//                                 imageSize: _controller!.value.previewSize!
-//                             )
-//                         )
-//                     ),
+//                     child: CameraPreview(_controller!, child: CustomPaint(painter: FacePainter(faces: _faces, imageSize: _controller!.value.previewSize!))),
 //                   ),
 //                 ),
 //               )
 //             else
 //               const Center(child: CircularProgressIndicator(color: Colors.white)),
 //
-//             // Back Button (Top Left)
+//             // Back Button
 //             Positioned(
 //               top: 50, left: 20,
 //               child: IconButton(
@@ -761,77 +680,42 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Widg
 //               ),
 //             ),
 //
-//             // 🔴 FORCE CHECKOUT TOGGLE (Top Right)
+//             // Toggle
 //             Positioned(
 //               top: 50, right: 20,
 //               child: Container(
 //                 padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-//                 decoration: BoxDecoration(
-//                   color: Colors.black54,
-//                   borderRadius: BorderRadius.circular(30),
-//                   border: _isForceCheckout ? Border.all(color: Colors.redAccent, width: 2) : null,
-//                 ),
+//                 decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(30), border: _isForceCheckout ? Border.all(color: Colors.redAccent, width: 2) : null),
 //                 child: Row(
 //                   mainAxisSize: MainAxisSize.min,
 //                   children: [
-//                     Text(
-//                       "Force Out",
-//                       style: TextStyle(
-//                           color: _isForceCheckout ? Colors.redAccent : Colors.white,
-//                           fontWeight: FontWeight.bold,
-//                           fontSize: 12
-//                       ),
-//                     ),
+//                     Text("Force Out", style: TextStyle(color: _isForceCheckout ? Colors.redAccent : Colors.white, fontWeight: FontWeight.bold, fontSize: 12)),
 //                     const SizedBox(width: 5),
-//                     Transform.scale(
-//                       scale: 0.8,
-//                       child: Switch(
-//                         value: _isForceCheckout,
-//                         activeColor: Colors.red,
-//                         activeTrackColor: Colors.red.withOpacity(0.3),
-//                         inactiveThumbColor: Colors.white,
-//                         inactiveTrackColor: Colors.grey,
-//                         onChanged: (val) {
-//                           setState(() => _isForceCheckout = val);
-//                         },
-//                       ),
-//                     ),
+//                     Transform.scale(scale: 0.8, child: Switch(value: _isForceCheckout, activeColor: Colors.red, onChanged: (v) => setState(() => _isForceCheckout = v))),
 //                   ],
 //                 ),
 //               ),
 //             ),
 //
-//             // Bottom Status Bar
+//             // Bottom Panel
 //             Positioned(
 //               bottom: 0, left: 0, right: 0,
 //               child: Container(
 //                 padding: const EdgeInsets.fromLTRB(20, 30, 20, 40),
-//                 decoration: BoxDecoration(
-//                     color: _isForceCheckout
-//                         ? Colors.red.withOpacity(0.8) // Red background if Force Checkout is ON
-//                         : Colors.black.withOpacity(0.7),
-//                     borderRadius: const BorderRadius.vertical(top: Radius.circular(30))
-//                 ),
+//                 decoration: BoxDecoration(color: _isForceCheckout ? Colors.red.withOpacity(0.8) : Colors.black.withOpacity(0.7), borderRadius: const BorderRadius.vertical(top: Radius.circular(30))),
 //                 child: Column(
 //                   mainAxisSize: MainAxisSize.min,
 //                   children: [
-//                     _isProcessing
-//                         ? const CircularProgressIndicator(color: Colors.white)
+//                     _isBusy
+//                         ? const SizedBox(height: 30, width: 30, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 3))
 //                         : Icon(_isForceCheckout ? Icons.logout : Icons.face, color: Colors.white, size: 40),
 //                     const SizedBox(height: 15),
 //                     Text(
-//                       _isProcessing
-//                           ? "Processing..."
-//                           : (_isForceCheckout ? "FORCE CHECK-OUT MODE" : "Face Recognition Active"),
+//                       _isBusy ? "Processing..." : (_isForceCheckout ? "FORCE CHECK-OUT MODE" : "Face Recognition Active"),
 //                       style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
 //                     ),
 //                     const SizedBox(height: 5),
-//                     Text(
-//                         _isForceCheckout
-//                             ? "Caution: This will force mark attendance as OUT"
-//                             : "Attendance will be marked for the detected face",
-//                         style: const TextStyle(color: Colors.white70, fontSize: 12)
-//                     ),
+//                     Text(_faces.isEmpty ? "Align face in center" : "Face Detected!", style: TextStyle(color: _faces.isEmpty ? Colors.white54 : Colors.greenAccent, fontSize: 12)),
 //                   ],
 //                 ),
 //               ),
@@ -845,30 +729,26 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Widg
 //   void _showTopNotification(String m, bool err) {
 //     if (!mounted) return;
 //     OverlayEntry entry = OverlayEntry(builder: (c) => Positioned(
-//         top: 60, left: 20, right: 20,
+//         top: 130, left: 20, right: 20,
 //         child: Material(
 //             color: Colors.transparent,
 //             child: Container(
 //                 padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
 //                 decoration: BoxDecoration(color: err ? Colors.redAccent : Colors.green, borderRadius: BorderRadius.circular(30)),
-//                 child: Row(
-//                   children: [
-//                     Icon(err ? Icons.error_outline : Icons.check_circle, color: Colors.white),
-//                     const SizedBox(width: 10),
-//                     Expanded(child: Text(m, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold))),
-//                   ],
-//                 )
+//                 child: Row(children: [Icon(err ? Icons.error_outline : Icons.check_circle, color: Colors.white), const SizedBox(width: 10), Expanded(child: Text(m, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)))])
 //             )
 //         )
 //     ));
 //     Overlay.of(context).insert(entry);
-//     Future.delayed(const Duration(seconds: 3), () => entry.remove());
+//     Future.delayed(const Duration(seconds: 2), () => entry.remove());
 //   }
 //
 //   @override
 //   void dispose() {
 //     WidgetsBinding.instance.removeObserver(this);
-//     _controller?.dispose();
+//     final camera = _controller;
+//     _controller = null;
+//     if (camera != null) camera.dispose();
 //     _faceDetector.close();
 //     super.dispose();
 //   }
@@ -885,22 +765,15 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Widg
 //
 //
 //
-//
-//
-//
-//
-//
-//
 // // import 'dart:async';
 // // import 'dart:io';
 // // import 'package:camera/camera.dart';
-// // import 'package:face_attendance/screens/Admin%20Side/admin_dashboard_screen.dart';
+// // import 'package:flutter/foundation.dart'; // WriteBuffer
 // // import 'package:flutter/material.dart';
 // // import 'package:geolocator/geolocator.dart';
 // // import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 // // import 'package:intl/intl.dart';
 // // import 'dart:ui';
-// // import 'package:shared_preferences/shared_preferences.dart';
 // //
 // // import '../../main.dart';
 // // import '../../services/api_service.dart';
@@ -920,118 +793,122 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Widg
 // //   final ApiService _apiService = ApiService();
 // //
 // //   CameraController? _controller;
+// //   // 🔴 Reference Code Variable
+// //   CameraDescription? _cameraDescription;
 // //   late FaceDetector _faceDetector;
 // //   List<Face> _faces = [];
 // //
+// //   // 🔴 Flags (Exact Employee Screen Logic)
 // //   bool _isNavigating = false;
 // //   bool _isDetecting = false;
 // //   bool _isProcessing = false;
 // //   bool _canScan = false;
 // //
+// //   // 🔴 Admin Special Toggle
+// //   bool _isForceCheckout = false;
+// //
 // //   @override
 // //   void initState() {
 // //     super.initState();
 // //     WidgetsBinding.instance.addObserver(this);
-// //     _faceDetector = FaceDetector(options: FaceDetectorOptions(performanceMode: FaceDetectorMode.fast));
+// //
+// //     // 1. Settings: Fast Mode (Same as Reference)
+// //     _faceDetector = FaceDetector(options: FaceDetectorOptions(
+// //         performanceMode: FaceDetectorMode.fast,
+// //         enableContours: false,
+// //         enableClassification: false
+// //     ));
 // //
 // //     _initializeCamera();
 // //
-// //     // Thoda delay taaki camera settle ho jaye
+// //     // 2. Initial Delay
 // //     Future.delayed(const Duration(seconds: 2), () {
 // //       if (mounted) setState(() => _canScan = true);
 // //     });
 // //   }
 // //
-// //   // 🔴 LIFECYCLE HANDLE (App Minimize/Resume Fix)
 // //   @override
 // //   void didChangeAppLifecycleState(AppLifecycleState state) {
-// //     final CameraController? cameraController = _controller;
+// //     // Agar controller pehle se null hai to kuch mat karo
+// //     if (_controller == null || !_controller!.value.isInitialized) return;
 // //
-// //     // App background me gaya ya inactive hua -> Camera band karo
-// //     if (cameraController == null || !cameraController.value.isInitialized) {
-// //       return;
+// //     if (state == AppLifecycleState.inactive || state == AppLifecycleState.paused) {
+// //       // 🔴 APP BACKGROUND ME GAYA:
+// //       // Pehle UI update karo taaki 'CameraPreview' hat jaye aur 'Loader' dikhe
+// //       if (mounted) {
+// //         setState(() => _controller = null);
+// //       }
+// //       // Phir camera dispose karo
+// //       _controller?.dispose();
 // //     }
-// //
-// //     if (state == AppLifecycleState.inactive) {
-// //       _stopCamera(); // Safe stop
-// //     } else if (state == AppLifecycleState.resumed) {
-// //       _initializeCamera(); // Wapis aaya to start karo
+// //     else if (state == AppLifecycleState.resumed) {
+// //       // 🔴 APP WAPIS AAYA:
+// //       // Camera dobara start karo
+// //       _initializeCamera();
 // //     }
 // //   }
 // //
+// //   // 🔴 Initialization Logic (Exact Copy of Employee Screen)
 // //   void _initializeCamera() async {
 // //     if (cameras.isEmpty) return;
 // //
-// //     // 1. Purana Controller Hatayo UI se
+// //     // 🔴 AGAR PURANA HAI TO USE DISPOSE KARO
 // //     if (_controller != null) {
-// //       await _stopCamera();
+// //       await _controller?.dispose();
 // //     }
 // //
-// //     // 2. Front Camera Dhundo
-// //     CameraDescription selectedCamera = cameras[0];
-// //     for (var camera in cameras) {
-// //       if (camera.lensDirection == CameraLensDirection.front) {
-// //         selectedCamera = camera;
-// //         break;
-// //       }
-// //     }
+// //     _cameraDescription = cameras.firstWhere(
+// //           (camera) => camera.lensDirection == CameraLensDirection.front,
+// //       orElse: () => cameras.first,
+// //     );
 // //
-// //     // 3. Naya Controller Banao
-// //     CameraController newController = CameraController(
-// //       selectedCamera,
-// //       ResolutionPreset.medium,
+// //     _controller = CameraController(
+// //       _cameraDescription!,
+// //       ResolutionPreset.medium, // Medium works in Employee screen
 // //       enableAudio: false,
 // //       imageFormatGroup: Platform.isAndroid ? ImageFormatGroup.nv21 : ImageFormatGroup.bgra8888,
 // //     );
 // //
 // //     try {
-// //       await newController.initialize();
+// //       await _controller!.initialize();
 // //       if (!mounted) return;
+// //       setState(() {});
 // //
-// //       setState(() => _controller = newController);
-// //
-// //       newController.startImageStream((image) {
+// //       _controller!.startImageStream((image) {
+// //         // Continuous Scanning Loop
 // //         if (_canScan && !_isDetecting && !_isNavigating && !_isProcessing) {
 // //           _doFaceDetection(image);
 // //         }
 // //       });
 // //     } catch (e) {
-// //       debugPrint("Camera Init Error: $e");
+// //       debugPrint("Camera Error: $e");
 // //     }
 // //   }
 // //
-// //   // 🔴 FIX: Safe Camera Stop (UI se pehle hatao, fir dispose karo)
 // //   Future<void> _stopCamera() async {
+// //     if (_controller == null) return;
 // //     final oldController = _controller;
+// //     _controller = null;
+// //     if (mounted) setState(() {});
 // //
-// //     // Step 1: UI Update (CameraPreview Hatao)
-// //     if (mounted) {
-// //       setState(() {
-// //         _controller = null;
-// //       });
-// //     }
-// //
-// //     // Step 2: Background Dispose
-// //     if (oldController != null) {
-// //       try {
-// //         // Stream roko agar chal rahi ho
-// //         if (oldController.value.isStreamingImages) {
-// //           await oldController.stopImageStream();
-// //         }
-// //         await oldController.dispose();
-// //       } catch (e) {
-// //         debugPrint("Dispose Error: $e");
-// //       }
-// //     }
+// //     try {
+// //       await oldController!.stopImageStream();
+// //       await oldController.dispose();
+// //     } catch (e) {}
 // //   }
 // //
+// //   // 🔴 DETECTION LOGIC (Exact Copy + Admin Toggle)
 // //   Future<void> _doFaceDetection(CameraImage image) async {
 // //     if (_isDetecting || _isNavigating || !mounted) return;
 // //     _isDetecting = true;
 // //
 // //     try {
-// //       final inputImage = _convertCameraImage(image);
-// //       if (inputImage == null) return;
+// //       // Input Image Conversion
+// //       final inputImage = _inputImageFromCameraImage(image);
+// //       if (inputImage == null) {
+// //         _isDetecting = false;
+// //         return;
+// //       }
 // //
 // //       final faces = await _faceDetector.processImage(inputImage);
 // //       if (mounted) setState(() => _faces = faces);
@@ -1041,126 +918,128 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Widg
 // //         return;
 // //       }
 // //
-// //       // 🔴 Internet Check
-// //       try {
-// //         final result = await InternetAddress.lookup('google.com');
-// //         if (result.isEmpty || result[0].rawAddress.isEmpty) {
-// //           throw SocketException("No Internet");
-// //         }
-// //       } on SocketException {
-// //         if (mounted && !_isNavigating) {
-// //           _showTopNotification("No Internet Connection", true);
-// //         }
-// //         _isDetecting = false;
-// //         return;
-// //       }
-// //
+// //       // Face found -> Start Processing
 // //       if (mounted && !_isProcessing) {
 // //         setState(() => _isProcessing = true);
 // //       }
 // //
-// //       // Embedding Generation
+// //       // --- CORE API LOGIC ---
 // //       List<double> embedding = await _mlService.getEmbedding(image, faces[0]);
-// //
-// //       // Get Data
-// //       SharedPreferences prefs = await SharedPreferences.getInstance();
-// //       String? loggedInName = prefs.getString('emp_name');
-// //       String? loggedInId = prefs.getString('emp_id');
-// //
-// //       // Get Location
 // //       Position pos = await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.high);
+// //       String currentTime = DateTime.now().toIso8601String();
+// //       // 🔴 CHANGE: Force Out Toggle Check
+// //       Map<String, dynamic> result;
+// //       if (_isForceCheckout) {
+// //         result = await _apiService.forceCheckOut(
+// //           faceEmbedding: embedding,
+// //           latitude: pos.latitude,
+// //           longitude: pos.longitude,
+// //           isFromAdminPhone: true,
+// //           deviceDate: currentTime,
+// //         );
+// //       } else {
+// //         result = await _apiService.markAttendance(
+// //           faceEmbedding: embedding,
+// //           latitude: pos.latitude,
+// //           longitude: pos.longitude,
+// //           isFromAdminPhone: true,
+// //           deviceDate: currentTime,
+// //         );
+// //       }
 // //
-// //       // API Call
-// //       Map<String, dynamic> result = await _apiService.markAttendance(
-// //         faceEmbedding: embedding,
-// //         latitude: pos.latitude,
-// //         longitude: pos.longitude,
-// //         isFromAdminPhone: true,
-// //       );
-// //
-// //       bool isSuccess = result['success'] == true;
+// //       bool isSuccess = result['success'] == true ;
 // //       String backendMessage = result['message'] ?? "Unknown Response";
 // //
 // //       if (isSuccess) {
+// //         print("-----------------------------ye chlaaa");
+// //         // ✅ Success: Stop Camera & Navigate
 // //         _isNavigating = true;
-// //
-// //         // 🔴 Camera Safe Stop call karo
 // //         await _stopCamera();
 // //
-// //         String detectedName = "Employee";
-// //         if (result['data'] != null) {
-// //           var data = result['data'];
-// //           var empData = data['employee'] ?? data;
-// //           detectedName = empData['name'] ?? "Employee";
-// //         }
-// //
-// //         if (!mounted) return;
-// //
-// //         // Result Screen par jao
-// //         await Navigator.pushReplacement(
-// //           context,
-// //           MaterialPageRoute(builder: (context) => ResultScreen(
-// //               name: detectedName,
-// //               imagePath: "",
-// //               punchStatus: backendMessage,
-// //               punchTime: DateFormat('hh:mm a').format(DateTime.now())
-// //           )),
-// //         );
+// //         String finalName = _getSafeName(result);
 // //
 // //         if (mounted) {
-// //           Navigator.pushAndRemoveUntil(
+// //           await Navigator.pushReplacement(
 // //               context,
-// //               MaterialPageRoute(builder: (c) => const AdminDashboard()),
-// //                   (route) => false
+// //               MaterialPageRoute(builder: (context) => ResultScreen(
+// //                   name: finalName,
+// //                   imagePath: "",
+// //                   punchStatus: backendMessage,
+// //                   punchTime: DateFormat('hh:mm a').format(DateTime.now())
+// //               ))
 // //           );
 // //         }
-// //
 // //       } else {
+// //         print("-----------------------------ye chlaaa2222222222");
+// //         // ❌ Failure: Show Toast & CONTINUE LOOP
 // //         if (mounted) _showTopNotification(backendMessage, true);
 // //
-// //         // Thoda wait karo error padhne ke liye
+// //         // 2 Second wait (Memory cleaning time)
 // //         await Future.delayed(const Duration(seconds: 2));
 // //
-// //         if (mounted) {
-// //           setState(() {
-// //             _isProcessing = false;
-// //             _isDetecting = false;
-// //           });
-// //         }
+// //         // Flags Reset -> Loop continues
+// //         if (mounted) setState(() {
+// //           _isProcessing = false;
+// //           _isDetecting = false;
+// //         });
 // //       }
+// //
 // //     } catch (e) {
 // //       debugPrint("Error: $e");
-// //       if (mounted) {
-// //         setState(() => _isProcessing = false);
-// //         _showTopNotification("Scan Failed. Try Again.", true);
-// //       }
+// //       if (mounted) setState(() => _isProcessing = false);
 // //     } finally {
+// //       // Safety Reset
 // //       if (mounted && !_isNavigating && !_isProcessing) _isDetecting = false;
 // //     }
 // //   }
 // //
-// //   InputImage? _convertCameraImage(CameraImage image) {
-// //     if (_controller == null) return null;
+// //   // Helper Name Extractor
+// //   String _getSafeName(Map<String, dynamic> response) {
 // //     try {
-// //       final camera = _controller!.description;
-// //       final sensorOrientation = camera.sensorOrientation;
-// //       InputImageRotation rotation = InputImageRotation.rotation0deg;
+// //       var data = response['data'];
+// //       if (data == null) return "Verified User";
 // //
-// //       if (Platform.isAndroid) {
-// //         var rotationCompensation = (sensorOrientation + 0) % 360;
-// //         rotation = InputImageRotationValue.fromRawValue(rotationCompensation) ?? InputImageRotation.rotation270deg;
+// //       // 1. Force Checkout Structure (data -> employee -> name)
+// //       if (data['employee'] != null && data['employee'] is Map) {
+// //         return data['employee']['name'] ?? "Verified User";
 // //       }
 // //
-// //       return InputImage.fromBytes(
-// //           bytes: _mlService.concatenatePlanes(image.planes),
-// //           metadata: InputImageMetadata(
-// //               size: Size(image.width.toDouble(), image.height.toDouble()),
-// //               rotation: rotation,
-// //               format: Platform.isAndroid ? InputImageFormat.nv21 : InputImageFormat.bgra8888,
-// //               bytesPerRow: image.planes[0].bytesPerRow
-// //           )
-// //       );
-// //     } catch (_) { return null; }
+// //       // 2. Normal Attendance Structure (data -> name)
+// //       if (data['name'] != null) return data['name'];
+// //
+// //       // 3. Record Structure
+// //       if (data['record'] != null && data['record']['employeeId'] != null) {
+// //         var emp = data['record']['employeeId'];
+// //         if (emp is Map) return emp['name'] ?? "Verified User";
+// //       }
+// //
+// //       return "Verified User";
+// //     } catch (_) { return "Verified User"; }
+// //   }
+// //   // 🔴 Standard Input Image Logic (Exact Reference Copy)
+// //   InputImage? _inputImageFromCameraImage(CameraImage image) {
+// //     if (_controller == null || _cameraDescription == null) return null;
+// //
+// //     final rotation = InputImageRotationValue.fromRawValue(_cameraDescription!.sensorOrientation);
+// //     if (rotation == null) return null;
+// //
+// //     final format = InputImageFormatValue.fromRawValue(image.format.raw);
+// //     if (format == null || (Platform.isAndroid && format != InputImageFormat.nv21)) return null;
+// //
+// //     final WriteBuffer allBytes = WriteBuffer();
+// //     for (final Plane plane in image.planes) {
+// //       allBytes.putUint8List(plane.bytes);
+// //     }
+// //     final bytes = allBytes.done().buffer.asUint8List();
+// //
+// //     final metadata = InputImageMetadata(
+// //       size: Size(image.width.toDouble(), image.height.toDouble()),
+// //       rotation: rotation,
+// //       format: format,
+// //       bytesPerRow: image.planes[0].bytesPerRow,
+// //     );
+// //
+// //     return InputImage.fromBytes(bytes: bytes, metadata: metadata);
 // //   }
 // //
 // //   @override
@@ -1175,7 +1054,7 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Widg
 // //         backgroundColor: Colors.black,
 // //         body: Stack(
 // //           children: [
-// //             // 🔴 Safe Check: Initialize check + Navigating check
+// //             // Camera Preview
 // //             if (_controller != null && _controller!.value.isInitialized && !_isNavigating)
 // //               SizedBox.expand(
 // //                 child: FittedBox(
@@ -1183,21 +1062,14 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Widg
 // //                   child: SizedBox(
 // //                     width: _controller!.value.previewSize!.height,
 // //                     height: _controller!.value.previewSize!.width,
-// //                     child: CameraPreview(
-// //                         _controller!,
-// //                         child: CustomPaint(
-// //                             painter: FacePainter(
-// //                                 faces: _faces,
-// //                                 imageSize: _controller!.value.previewSize!
-// //                             )
-// //                         )
-// //                     ),
+// //                     child: CameraPreview(_controller!, child: CustomPaint(painter: FacePainter(faces: _faces, imageSize: _controller!.value.previewSize!))),
 // //                   ),
 // //                 ),
 // //               )
 // //             else
 // //               const Center(child: CircularProgressIndicator(color: Colors.white)),
 // //
+// //             // Back Button
 // //             Positioned(
 // //               top: 50, left: 20,
 // //               child: IconButton(
@@ -1207,27 +1079,42 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Widg
 // //               ),
 // //             ),
 // //
+// //             // 🔴 Admin Toggle Button
+// //             Positioned(
+// //               top: 50, right: 20,
+// //               child: Container(
+// //                 padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+// //                 decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(30), border: _isForceCheckout ? Border.all(color: Colors.redAccent, width: 2) : null),
+// //                 child: Row(
+// //                   mainAxisSize: MainAxisSize.min,
+// //                   children: [
+// //                     Text("Force Out", style: TextStyle(color: _isForceCheckout ? Colors.redAccent : Colors.white, fontWeight: FontWeight.bold, fontSize: 12)),
+// //                     const SizedBox(width: 5),
+// //                     Transform.scale(scale: 0.8, child: Switch(value: _isForceCheckout, activeColor: Colors.red, onChanged: (v) => setState(() => _isForceCheckout = v))),
+// //                   ],
+// //                 ),
+// //               ),
+// //             ),
+// //
+// //             // Bottom UI
 // //             Positioned(
 // //               bottom: 0, left: 0, right: 0,
 // //               child: Container(
 // //                 padding: const EdgeInsets.fromLTRB(20, 30, 20, 40),
-// //                 decoration: BoxDecoration(
-// //                     color: Colors.black.withOpacity(0.7),
-// //                     borderRadius: const BorderRadius.vertical(top: Radius.circular(30))
-// //                 ),
+// //                 decoration: BoxDecoration(color: _isForceCheckout ? Colors.red.withOpacity(0.8) : Colors.black.withOpacity(0.7), borderRadius: const BorderRadius.vertical(top: Radius.circular(30))),
 // //                 child: Column(
 // //                   mainAxisSize: MainAxisSize.min,
 // //                   children: [
 // //                     _isProcessing
-// //                         ? const CircularProgressIndicator(color: Colors.white)
-// //                         : const Icon(Icons.face, color: Colors.white, size: 40),
+// //                         ? const SizedBox(height: 30, width: 30, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 3))
+// //                         : Icon(_isForceCheckout ? Icons.logout : Icons.face, color: Colors.white, size: 40),
 // //                     const SizedBox(height: 15),
 // //                     Text(
-// //                       _isProcessing ? "Processing..." : "Face Recognition Active",
+// //                       _isProcessing ? "Processing..." : (_isForceCheckout ? "FORCE CHECK-OUT MODE" : "Face Recognition Active"),
 // //                       style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
 // //                     ),
 // //                     const SizedBox(height: 5),
-// //                     const Text("Attendance will be marked for the detected face", style: TextStyle(color: Colors.white54, fontSize: 12)),
+// //                     Text(_faces.isEmpty ? "Align face in center" : "Face Detected!", style: TextStyle(color: _faces.isEmpty ? Colors.white54 : Colors.greenAccent, fontSize: 12)),
 // //                   ],
 // //                 ),
 // //               ),
@@ -1241,695 +1128,29 @@ class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with Widg
 // //   void _showTopNotification(String m, bool err) {
 // //     if (!mounted) return;
 // //     OverlayEntry entry = OverlayEntry(builder: (c) => Positioned(
-// //         top: 60, left: 20, right: 20,
+// //         top: 130, left: 20, right: 20,
 // //         child: Material(
 // //             color: Colors.transparent,
 // //             child: Container(
 // //                 padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
 // //                 decoration: BoxDecoration(color: err ? Colors.redAccent : Colors.green, borderRadius: BorderRadius.circular(30)),
-// //                 child: Row(
-// //                   children: [
-// //                     Icon(err ? Icons.error_outline : Icons.check_circle, color: Colors.white),
-// //                     const SizedBox(width: 10),
-// //                     Expanded(child: Text(m, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold))),
-// //                   ],
-// //                 )
+// //                 child: Row(children: [Icon(err ? Icons.error_outline : Icons.check_circle, color: Colors.white), const SizedBox(width: 10), Expanded(child: Text(m, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)))])
 // //             )
 // //         )
 // //     ));
 // //     Overlay.of(context).insert(entry);
-// //     Future.delayed(const Duration(seconds: 3), () => entry.remove());
+// //     Future.delayed(const Duration(seconds: 2), () => entry.remove());
 // //   }
 // //
 // //   @override
 // //   void dispose() {
 // //     WidgetsBinding.instance.removeObserver(this);
-// //     // Dispose logic handle in Stop Camera mainly
-// //     _controller?.dispose();
+// //     final camera = _controller;
+// //     _controller = null;
+// //     if (camera != null) camera.dispose();
 // //     _faceDetector.close();
 // //     super.dispose();
 // //   }
-// //
-// //
-// //
-// //
 // // }
 // //
 // //
-// //
-// //
-// //
-// //
-// //
-// //
-// //
-// //
-// //
-// // // import 'dart:async';
-// // // import 'dart:io'; // 🔴 Added for Internet Check
-// // // import 'package:camera/camera.dart';
-// // // import 'package:face_attendance/screens/Admin%20Side/admin_dashboard_screen.dart';
-// // // import 'package:flutter/material.dart';
-// // // import 'package:geolocator/geolocator.dart';
-// // // import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
-// // // import 'package:intl/intl.dart';
-// // // import 'dart:ui';
-// // // import 'package:shared_preferences/shared_preferences.dart';
-// // //
-// // // import '../../main.dart';
-// // // import '../../services/api_service.dart';
-// // // import '../../services/ml_service.dart';
-// // // import '../../widgets/face_painter.dart';
-// // // import '../Result_StartLogin Side/result_screen.dart';
-// // //
-// // // class AdminAttendanceScreen extends StatefulWidget {
-// // //   const AdminAttendanceScreen({super.key});
-// // //
-// // //   @override
-// // //   State<AdminAttendanceScreen> createState() => _AdminAttendanceScreenState();
-// // // }
-// // //
-// // // class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with WidgetsBindingObserver {
-// // //   final MLService _mlService = MLService();
-// // //   final ApiService _apiService = ApiService();
-// // //
-// // //   CameraController? _controller;
-// // //   late FaceDetector _faceDetector;
-// // //   List<Face> _faces = [];
-// // //
-// // //   bool _isNavigating = false;
-// // //   bool _isDetecting = false;
-// // //   bool _isProcessing = false;
-// // //   bool _canScan = false;
-// // //
-// // //   @override
-// // //   void initState() {
-// // //     super.initState();
-// // //     WidgetsBinding.instance.addObserver(this);
-// // //     _faceDetector = FaceDetector(options: FaceDetectorOptions(performanceMode: FaceDetectorMode.fast));
-// // //     _initializeCamera();
-// // //
-// // //     Future.delayed(const Duration(seconds: 2), () {
-// // //       if (mounted) setState(() => _canScan = true);
-// // //     });
-// // //   }
-// // //
-// // //   // 🔴 FIX 1: Safe Camera Initialization
-// // //   void _initializeCamera() async {
-// // //     if (cameras.isEmpty) return;
-// // //     if (_controller != null) await _controller!.dispose();
-// // //
-// // //     // Smartly find Front Camera
-// // //     CameraDescription selectedCamera = cameras[0];
-// // //     for (var camera in cameras) {
-// // //       if (camera.lensDirection == CameraLensDirection.front) {
-// // //         selectedCamera = camera;
-// // //         break;
-// // //       }
-// // //     }
-// // //
-// // //     CameraController newController = CameraController(
-// // //       selectedCamera, // 🔴 No hardcoded index
-// // //       ResolutionPreset.medium,
-// // //       enableAudio: false,
-// // //       imageFormatGroup: Platform.isAndroid ? ImageFormatGroup.nv21 : ImageFormatGroup.bgra8888,
-// // //     );
-// // //
-// // //     try {
-// // //       await newController.initialize();
-// // //       if (!mounted) return;
-// // //       setState(() => _controller = newController);
-// // //       newController.startImageStream((image) {
-// // //         if (_canScan && !_isDetecting && !_isNavigating && !_isProcessing) {
-// // //           _doFaceDetection(image);
-// // //         }
-// // //       });
-// // //     } catch (e) {
-// // //       debugPrint("Camera Error: $e");
-// // //     }
-// // //   }
-// // //
-// // //   Future<void> _stopCamera() async {
-// // //     if (_controller == null) return;
-// // //     final oldController = _controller;
-// // //     _controller = null; // UI ko turant batao camera band hai
-// // //
-// // //     try {
-// // //       if (oldController!.value.isStreamingImages) await oldController.stopImageStream();
-// // //       await oldController.dispose();
-// // //     } catch (e) {
-// // //       debugPrint("Stop Error: $e");
-// // //     }
-// // //   }
-// // //
-// // //   Future<void> _doFaceDetection(CameraImage image) async {
-// // //     if (_isDetecting || _isNavigating || !mounted) return;
-// // //     _isDetecting = true;
-// // //
-// // //     try {
-// // //       final inputImage = _convertCameraImage(image);
-// // //       if (inputImage == null) return;
-// // //
-// // //       final faces = await _faceDetector.processImage(inputImage);
-// // //       if (mounted) setState(() => _faces = faces);
-// // //
-// // //       if (faces.isEmpty) {
-// // //         _isDetecting = false;
-// // //         return;
-// // //       }
-// // //
-// // //       // Check Internet Connection First
-// // //       try {
-// // //         final result = await InternetAddress.lookup('google.com');
-// // //         if (result.isEmpty || result[0].rawAddress.isEmpty) {
-// // //           throw SocketException("No Internet");
-// // //         }
-// // //       } on SocketException {
-// // //         if (mounted) _showTopNotification("No Internet Connection", true);
-// // //         _isDetecting = false;
-// // //         return;
-// // //       }
-// // //
-// // //       if (mounted && !_isProcessing) {
-// // //         setState(() => _isProcessing = true);
-// // //       }
-// // //
-// // //       List<double> embedding = await _mlService.getEmbedding(image, faces[0]);
-// // //
-// // //       SharedPreferences prefs = await SharedPreferences.getInstance();
-// // //       String? loggedInName = prefs.getString('emp_name');
-// // //       String? loggedInId = prefs.getString('emp_id');
-// // //
-// // //       Position pos = await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.high);
-// // //
-// // //       Map<String, dynamic> result = await _apiService.markAttendance(
-// // //         faceEmbedding: embedding,
-// // //         latitude: pos.latitude,
-// // //         longitude: pos.longitude,
-// // //         isFromAdminPhone: true,
-// // //       );
-// // //
-// // //       bool isSuccess = result['success'] == true;
-// // //       String backendMessage = result['message'] ?? "Unknown Response";
-// // //
-// // //       if (isSuccess) {
-// // //         _isNavigating = true;
-// // //         await _stopCamera();
-// // //
-// // //         String detectedName = "Employee";
-// // //
-// // //         if (result['data'] != null) {
-// // //           var data = result['data'];
-// // //           var empData = data['employee'] ?? data;
-// // //           detectedName = empData['name'] ?? "Employee";
-// // //         }
-// // //
-// // //         if (!mounted) return;
-// // //
-// // //         await Navigator.pushReplacement(
-// // //           context,
-// // //           MaterialPageRoute(builder: (context) => ResultScreen(
-// // //               name: detectedName,
-// // //               imagePath: "",
-// // //               punchStatus: backendMessage,
-// // //               punchTime: DateFormat('hh:mm a').format(DateTime.now())
-// // //           )),
-// // //         );
-// // //
-// // //         if (mounted) {
-// // //           Navigator.pushAndRemoveUntil(
-// // //               context,
-// // //               MaterialPageRoute(builder: (c) => AdminDashboard()),
-// // //                   (route) => false
-// // //           );
-// // //         }
-// // //
-// // //       } else {
-// // //         if (mounted) _showTopNotification(backendMessage, true);
-// // //         await Future.delayed(const Duration(seconds: 2));
-// // //         if (mounted) {
-// // //           setState(() {
-// // //             _isProcessing = false;
-// // //             _isDetecting = false;
-// // //           });
-// // //         }
-// // //       }
-// // //     } catch (e) {
-// // //       debugPrint("Error: $e");
-// // //       if (mounted) {
-// // //         setState(() => _isProcessing = false);
-// // //         // User ko error dikhana zaroori hai
-// // //         _showTopNotification("Scan Failed. Try Again.", true);
-// // //       }
-// // //     } finally {
-// // //       if (mounted && !_isNavigating && !_isProcessing) _isDetecting = false;
-// // //     }
-// // //   }
-// // //
-// // //   // 🔴 FIX 2: Dynamic Rotation Logic
-// // //   InputImage? _convertCameraImage(CameraImage image) {
-// // //     if (_controller == null) return null;
-// // //     try {
-// // //       final camera = _controller!.description;
-// // //       final sensorOrientation = camera.sensorOrientation;
-// // //       InputImageRotation rotation = InputImageRotation.rotation0deg;
-// // //
-// // //       if (Platform.isAndroid) {
-// // //         var rotationCompensation = (sensorOrientation + 0) % 360;
-// // //         rotation = InputImageRotationValue.fromRawValue(rotationCompensation)
-// // //             ?? InputImageRotation.rotation270deg;
-// // //       }
-// // //
-// // //       return InputImage.fromBytes(
-// // //           bytes: _mlService.concatenatePlanes(image.planes),
-// // //           metadata: InputImageMetadata(
-// // //               size: Size(image.width.toDouble(), image.height.toDouble()),
-// // //               rotation: rotation, // 🔴 Dynamic
-// // //               format: InputImageFormat.nv21,
-// // //               bytesPerRow: image.planes[0].bytesPerRow
-// // //           )
-// // //       );
-// // //     } catch (_) { return null; }
-// // //   }
-// // //
-// // //   @override
-// // //   Widget build(BuildContext context) {
-// // //     return PopScope(
-// // //       canPop: false,
-// // //       onPopInvokedWithResult: (didPop, result) {
-// // //         if (didPop) return;
-// // //         Navigator.pop(context);
-// // //       },
-// // //       child: Scaffold(
-// // //         backgroundColor: Colors.black,
-// // //         body: Stack(
-// // //           children: [
-// // //             if (_controller != null && _controller!.value.isInitialized && !_isNavigating)
-// // //               SizedBox.expand(
-// // //                 child: FittedBox(
-// // //                   fit: BoxFit.cover,
-// // //                   child: SizedBox(
-// // //                     width: _controller!.value.previewSize!.height,
-// // //                     height: _controller!.value.previewSize!.width,
-// // //                     child: CameraPreview(_controller!, child: CustomPaint(painter: FacePainter(faces: _faces, imageSize: _controller!.value.previewSize!))),
-// // //                   ),
-// // //                 ),
-// // //               )
-// // //             else
-// // //               const Center(child: CircularProgressIndicator(color: Colors.white)),
-// // //
-// // //             Positioned(
-// // //               top: 50, left: 20,
-// // //               child: IconButton(
-// // //                 icon: const Icon(Icons.arrow_back, color: Colors.white),
-// // //                 onPressed: () => Navigator.pop(context),
-// // //                 style: IconButton.styleFrom(backgroundColor: Colors.black45),
-// // //               ),
-// // //             ),
-// // //
-// // //             Positioned(
-// // //               bottom: 0, left: 0, right: 0,
-// // //               child: Container(
-// // //                 padding: const EdgeInsets.fromLTRB(20, 30, 20, 40),
-// // //                 decoration: BoxDecoration(
-// // //                     color: Colors.black.withOpacity(0.7),
-// // //                     borderRadius: const BorderRadius.vertical(top: Radius.circular(30))
-// // //                 ),
-// // //                 child: Column(
-// // //                   mainAxisSize: MainAxisSize.min,
-// // //                   children: [
-// // //                     _isProcessing ? const CircularProgressIndicator(color: Colors.white) : const Icon(Icons.face, color: Colors.white, size: 40),
-// // //                     const SizedBox(height: 15),
-// // //                     Text(
-// // //                       _isProcessing ? "Processing..." : "Face Recognition Active",
-// // //                       style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
-// // //                     ),
-// // //                     const SizedBox(height: 5),
-// // //                     const Text("Attendance will be marked for the detected face", style: TextStyle(color: Colors.white54, fontSize: 12)),
-// // //                   ],
-// // //                 ),
-// // //               ),
-// // //             ),
-// // //           ],
-// // //         ),
-// // //       ),
-// // //     );
-// // //   }
-// // //
-// // //   void _showTopNotification(String m, bool err) {
-// // //     if (!mounted) return;
-// // //     OverlayEntry entry = OverlayEntry(builder: (c) => Positioned(
-// // //         top: 60, left: 20, right: 20,
-// // //         child: Material(
-// // //             color: Colors.transparent,
-// // //             child: Container(
-// // //                 padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-// // //                 decoration: BoxDecoration(color: err ? Colors.redAccent : Colors.green, borderRadius: BorderRadius.circular(30)),
-// // //                 child: Row(
-// // //                   children: [
-// // //                     Icon(err ? Icons.error_outline : Icons.check_circle, color: Colors.white),
-// // //                     const SizedBox(width: 10),
-// // //                     Expanded(child: Text(m, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold))),
-// // //                   ],
-// // //                 )
-// // //             )
-// // //         )
-// // //     ));
-// // //     Overlay.of(context).insert(entry);
-// // //     Future.delayed(const Duration(seconds: 3), () => entry.remove());
-// // //   }
-// // //
-// // //   @override
-// // //   void dispose() {
-// // //     WidgetsBinding.instance.removeObserver(this);
-// // //     final camera = _controller;
-// // //     _controller = null;
-// // //     if (camera != null) {
-// // //       camera.dispose();
-// // //     }
-// // //     _faceDetector.close();
-// // //     super.dispose();
-// // //   }
-// // // }
-// // //
-// // //
-// // //
-// // //
-// // //
-// // //
-// // //
-// // //
-// // //
-// // //
-// // //
-// // //
-// // //
-// // // // import 'dart:async';
-// // // // import 'package:camera/camera.dart';
-// // // // import 'package:face_attendance/screens/Admin%20Side/admin_dashboard_screen.dart';
-// // // // import 'package:flutter/material.dart';
-// // // // import 'package:geolocator/geolocator.dart';
-// // // // import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
-// // // // import 'package:intl/intl.dart';
-// // // // import 'dart:ui';
-// // // // import 'package:shared_preferences/shared_preferences.dart';
-// // // //
-// // // // import '../../main.dart';
-// // // // import '../../services/api_service.dart';
-// // // // import '../../services/ml_service.dart';
-// // // // import '../../widgets/face_painter.dart';
-// // // // import '../Result_StartLogin Side/result_screen.dart';
-// // // //
-// // // //
-// // // // class AdminAttendanceScreen extends StatefulWidget {
-// // // //   const AdminAttendanceScreen({super.key});
-// // // //
-// // // //   @override
-// // // //   State<AdminAttendanceScreen> createState() => _AdminAttendanceScreenState();
-// // // // }
-// // // //
-// // // // class _AdminAttendanceScreenState extends State<AdminAttendanceScreen> with WidgetsBindingObserver {
-// // // //   final MLService _mlService = MLService();
-// // // //   final ApiService _apiService = ApiService();
-// // // //
-// // // //   CameraController? _controller;
-// // // //   late FaceDetector _faceDetector;
-// // // //   List<Face> _faces = [];
-// // // //
-// // // //   bool _isNavigating = false;
-// // // //   bool _isDetecting = false;
-// // // //   bool _isProcessing = false;
-// // // //   bool _canScan = false;
-// // // //
-// // // //   @override
-// // // //   void initState() {
-// // // //     super.initState();
-// // // //     WidgetsBinding.instance.addObserver(this);
-// // // //     _faceDetector = FaceDetector(options: FaceDetectorOptions(performanceMode: FaceDetectorMode.fast));
-// // // //     _initializeCamera();
-// // // //
-// // // //     Future.delayed(const Duration(seconds: 2), () {
-// // // //       if (mounted) setState(() => _canScan = true);
-// // // //     });
-// // // //   }
-// // // //
-// // // //   void _initializeCamera() async {
-// // // //     if (cameras.isEmpty) return;
-// // // //     if (_controller != null) await _controller!.dispose();
-// // // //
-// // // //     CameraController newController = CameraController(
-// // // //       cameras[1],
-// // // //       ResolutionPreset.medium,
-// // // //       enableAudio: false,
-// // // //       imageFormatGroup: ImageFormatGroup.yuv420,
-// // // //     );
-// // // //
-// // // //     try {
-// // // //       await newController.initialize();
-// // // //       if (!mounted) return;
-// // // //       setState(() => _controller = newController);
-// // // //       newController.startImageStream((image) {
-// // // //         if (_canScan && !_isDetecting && !_isNavigating && !_isProcessing) {
-// // // //           _doFaceDetection(image);
-// // // //         }
-// // // //       });
-// // // //     } catch (e) {
-// // // //       debugPrint("Camera Error: $e");
-// // // //     }
-// // // //   }
-// // // //
-// // // //   // 🔴 FIX: Safe Camera Stop (Logic Update)
-// // // //   Future<void> _stopCamera() async {
-// // // //     if (_controller == null) return;
-// // // //     final oldController = _controller;
-// // // //     _controller = null;
-// // // //
-// // // //     // Sirf tab setState karo jab widget active ho
-// // // //     if (mounted) setState(() {});
-// // // //
-// // // //     try {
-// // // //       if (oldController!.value.isStreamingImages) await oldController.stopImageStream();
-// // // //       await oldController.dispose();
-// // // //     } catch (e) {
-// // // //       debugPrint("Stop Error: $e");
-// // // //     }
-// // // //   }
-// // // //
-// // // //   Future<void> _doFaceDetection(CameraImage image) async {
-// // // //     if (_isDetecting || _isNavigating || !mounted) return;
-// // // //     _isDetecting = true;
-// // // //
-// // // //     try {
-// // // //       final inputImage = _convertCameraImage(image);
-// // // //       if (inputImage == null) return;
-// // // //
-// // // //       final faces = await _faceDetector.processImage(inputImage);
-// // // //       if (mounted) setState(() => _faces = faces);
-// // // //
-// // // //       if (faces.isEmpty) {
-// // // //         _isDetecting = false;
-// // // //         return;
-// // // //       }
-// // // //
-// // // //       if (mounted && !_isProcessing) {
-// // // //         setState(() => _isProcessing = true);
-// // // //       }
-// // // //
-// // // //       List<double> embedding = await _mlService.getEmbedding(image, faces[0]);
-// // // //
-// // // //       SharedPreferences prefs = await SharedPreferences.getInstance();
-// // // //       String? loggedInName = prefs.getString('emp_name');
-// // // //       String? loggedInId = prefs.getString('emp_id');
-// // // //
-// // // //       Position pos = await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.high);
-// // // //       Map<String, dynamic> result = await _apiService.markAttendance(
-// // // //         faceEmbedding: embedding,
-// // // //         latitude: pos.latitude,
-// // // //         longitude: pos.longitude,
-// // // //         accuracy: pos.accuracy,
-// // // //         isFromAdminPhone: true,
-// // // //       );
-// // // //
-// // // //       bool isSuccess = result['success'] == true;
-// // // //       String backendMessage = result['message'] ?? "Unknown Response";
-// // // //
-// // // //       if (isSuccess) {
-// // // //         _isNavigating = true;
-// // // //         await _stopCamera(); // Normal flow mein safe hai
-// // // //
-// // // //         String detectedName = "Employee";
-// // // //         String detectedId = "";
-// // // //
-// // // //         if (result['data'] != null) {
-// // // //           var data = result['data'];
-// // // //           var empData = data['employee'] ?? data;
-// // // //           detectedName = empData['name'] ?? "Employee";
-// // // //           detectedId = empData['_id'] ?? "";
-// // // //         }
-// // // //
-// // // //         if (!mounted) return;
-// // // //
-// // // //         await Navigator.pushReplacement(
-// // // //           context,
-// // // //           MaterialPageRoute(builder: (context) => ResultScreen(
-// // // //               name: detectedName,
-// // // //               imagePath: "",
-// // // //               punchStatus: backendMessage,
-// // // //               punchTime: DateFormat('hh:mm a').format(DateTime.now())
-// // // //           )),
-// // // //         );
-// // // //
-// // // //         String finalId = loggedInId ?? detectedId;
-// // // //         String finalName = loggedInName ?? detectedName;
-// // // //
-// // // //         if (mounted) {
-// // // //           Navigator.pushAndRemoveUntil(
-// // // //               context,
-// // // //               MaterialPageRoute(builder: (c) => AdminDashboard(
-// // // //               )),
-// // // //                   (route) => false
-// // // //           );
-// // // //         }
-// // // //
-// // // //       } else {
-// // // //         if (mounted) _showTopNotification(backendMessage, true);
-// // // //         await Future.delayed(const Duration(seconds: 2));
-// // // //         if (mounted) {
-// // // //           setState(() {
-// // // //             _isProcessing = false;
-// // // //             _isDetecting = false;
-// // // //           });
-// // // //         }
-// // // //       }
-// // // //     } catch (e) {
-// // // //       debugPrint("Error: $e");
-// // // //       if (mounted) setState(() => _isProcessing = false);
-// // // //     } finally {
-// // // //       if (mounted && !_isNavigating && !_isProcessing) _isDetecting = false;
-// // // //     }
-// // // //   }
-// // // //
-// // // //   @override
-// // // //   Widget build(BuildContext context) {
-// // // //     return PopScope(
-// // // //       canPop: false,
-// // // //       onPopInvokedWithResult: (didPop, result) {
-// // // //         if (didPop) return;
-// // // //         Navigator.pop(context);
-// // // //       },
-// // // //       child: Scaffold(
-// // // //         backgroundColor: Colors.black,
-// // // //         body: Stack(
-// // // //           children: [
-// // // //             if (_controller != null && _controller!.value.isInitialized && !_isNavigating)
-// // // //               SizedBox.expand(
-// // // //                 child: FittedBox(
-// // // //                   fit: BoxFit.cover,
-// // // //                   child: SizedBox(
-// // // //                     width: _controller!.value.previewSize!.height,
-// // // //                     height: _controller!.value.previewSize!.width,
-// // // //                     child: CameraPreview(_controller!, child: CustomPaint(painter: FacePainter(faces: _faces, imageSize: _controller!.value.previewSize!))),
-// // // //                   ),
-// // // //                 ),
-// // // //               )
-// // // //             else
-// // // //               const Center(child: CircularProgressIndicator(color: Colors.white)),
-// // // //
-// // // //             Positioned(
-// // // //               top: 50, left: 20,
-// // // //               child: IconButton(
-// // // //                 icon: const Icon(Icons.arrow_back, color: Colors.white),
-// // // //                 onPressed: () => Navigator.pop(context),
-// // // //                 style: IconButton.styleFrom(backgroundColor: Colors.black45),
-// // // //               ),
-// // // //             ),
-// // // //
-// // // //             Positioned(
-// // // //               bottom: 0, left: 0, right: 0,
-// // // //               child: Container(
-// // // //                 padding: const EdgeInsets.fromLTRB(20, 30, 20, 40),
-// // // //                 decoration: BoxDecoration(
-// // // //                     color: Colors.black.withOpacity(0.7),
-// // // //                     borderRadius: const BorderRadius.vertical(top: Radius.circular(30))
-// // // //                 ),
-// // // //                 child: Column(
-// // // //                   mainAxisSize: MainAxisSize.min,
-// // // //                   children: [
-// // // //                     _isProcessing ? const CircularProgressIndicator(color: Colors.white) : const Icon(Icons.face, color: Colors.white, size: 40),
-// // // //                     const SizedBox(height: 15),
-// // // //                     Text(
-// // // //                       _isProcessing ? "Processing..." : "Face Recognition Active",
-// // // //                       style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
-// // // //                     ),
-// // // //                     const SizedBox(height: 5),
-// // // //                     const Text("Attendance will be marked for the detected face", style: TextStyle(color: Colors.white54, fontSize: 12)),
-// // // //                   ],
-// // // //                 ),
-// // // //               ),
-// // // //             ),
-// // // //           ],
-// // // //         ),
-// // // //       ),
-// // // //     );
-// // // //   }
-// // // //
-// // // //   InputImage? _convertCameraImage(CameraImage image) {
-// // // //     try {
-// // // //       return InputImage.fromBytes(
-// // // //           bytes: _mlService.concatenatePlanes(image.planes),
-// // // //           metadata: InputImageMetadata(
-// // // //               size: Size(image.width.toDouble(), image.height.toDouble()),
-// // // //               rotation: InputImageRotation.rotation270deg,
-// // // //               format: InputImageFormat.nv21,
-// // // //               bytesPerRow: image.planes[0].bytesPerRow
-// // // //           )
-// // // //       );
-// // // //     } catch (_) { return null; }
-// // // //   }
-// // // //
-// // // //   void _showTopNotification(String m, bool err) {
-// // // //     if (!mounted) return;
-// // // //     OverlayEntry entry = OverlayEntry(builder: (c) => Positioned(
-// // // //         top: 60, left: 20, right: 20,
-// // // //         child: Material(
-// // // //             color: Colors.transparent,
-// // // //             child: Container(
-// // // //                 padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-// // // //                 decoration: BoxDecoration(color: err ? Colors.redAccent : Colors.green, borderRadius: BorderRadius.circular(30)),
-// // // //                 child: Row(
-// // // //                   children: [
-// // // //                     Icon(err ? Icons.error_outline : Icons.check_circle, color: Colors.white),
-// // // //                     const SizedBox(width: 10),
-// // // //                     Expanded(child: Text(m, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold))),
-// // // //                   ],
-// // // //                 )
-// // // //             )
-// // // //         )
-// // // //     ));
-// // // //     Overlay.of(context).insert(entry);
-// // // //     Future.delayed(const Duration(seconds: 3), () => entry.remove());
-// // // //   }
-// // // //
-// // // //   // 🔴 FIX: Updated Dispose Logic
-// // // //   @override
-// // // //   void dispose() {
-// // // //     WidgetsBinding.instance.removeObserver(this);
-// // // //
-// // // //     // Directly dispose controller without calling setState (Crash Prevention)
-// // // //     final camera = _controller;
-// // // //     _controller = null;
-// // // //     if (camera != null) {
-// // // //       camera.dispose();
-// // // //     }
-// // // //
-// // // //     _faceDetector.close();
-// // // //     super.dispose();
-// // // //   }
-// // // // }
-// // // //
-// // // //
-// // // //
-// // // //
-// // // //
-// // // //
-// // // //

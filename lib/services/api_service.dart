@@ -95,6 +95,7 @@ class ApiService {
       DeviceInfoPlugin deviceInfo = DeviceInfoPlugin();
       if (Platform.isAndroid) {
         AndroidDeviceInfo androidInfo = await deviceInfo.androidInfo;
+        print(("device id----------------------------------------$androidInfo"));
         return androidInfo.id; // Unique Android ID
       } else if (Platform.isIOS) {
         IosDeviceInfo iosInfo = await deviceInfo.iosInfo;
@@ -270,15 +271,17 @@ print("------------------------locations $locationIds");
               "deviceId": deviceId
         }),
       );
+      print("📩--------------------------------------------------Device id in authenticate : ${deviceId}");
       print("📩-------------------------------------------------- Response Status: ${response.statusCode}");
-      print("📩 --------------------------------------------------Response Body: ${response.body}");
+      print("📩 --------------------------------------------------authenticate Response Body: ${response.body}");
+      print("📩 --------------------------------------------------");
       if (response.statusCode == 200) {
         var data = jsonDecode(response.body);
         if (data['success'] == true) {
           if (data.containsKey('token')) {
             String token = data['token'];
 
-            String locationId = data['locationId'] ?? "";
+
             employeeToken = token;
             // String employeeId =data['employeeId'];
 
@@ -291,18 +294,21 @@ print("------------------------locations $locationIds");
 
             print("✅--------------------------- Token Saved Successfully: $token");
 
-            if (locationId.isNotEmpty) {
-              await prefs.setString('locationId', locationId); // ✅ Correctly Saved
-              print("✅--------------- Location ID Saved: $locationId");
+            if (data['location'] != null && data['location'] is List) {
+              List<dynamic> locArray = data['location'];
+              // List ko String banakar save karo
+              await prefs.setString('location_ids', jsonEncode(locArray));
+              print("✅ --------------------------------Location Array Saved: $locArray");
             } else {
-              print("⚠️ Location ID not found in response");
+              print("⚠️------------------------------------ Location Array missing in Face Login");
             }
           }
           return data;
         }
       }
+
       if (response.body.isNotEmpty) {
-        return jsonDecode(response.body); // ✅ Pura JSON wapas bhejo (Error samet)
+        return jsonDecode(response.body);
       }
       return null;
     } catch (e) {
@@ -314,7 +320,6 @@ print("------------------------locations $locationIds");
 
   Future<bool> employeeLogin(String email, String password) async {
     try {
-      // 🔴 URL confirm karlena backend se (/employee/login ya /employee/auth/login)
       var url = Uri.parse("$baseUrl/employee/login");
 
       var response = await http.post(
@@ -330,17 +335,37 @@ print("------------------------locations $locationIds");
         if (data['success'] == true) {
           employeeToken = data['token'];
 
-          // Token Save Karo
           SharedPreferences prefs = await SharedPreferences.getInstance();
+
+          // 1. Token Save
           await prefs.setString('token', employeeToken!);
           await prefs.setBool('is_employee_logged_in', true);
 
+          // 🔴 2. FIX: SAVE LOCATION ID & EMPLOYEE DETAILS
+          // Backend response structure usually 'employee' ya 'user' key mein data deta hai
+          var user = data['employee'] ?? data['user'] ?? data['data'];
+
+          if (user != null) {
+            // ID aur Name bhi save kar lo (Dashboard me kaam ayega)
+            if (user['_id'] != null) await prefs.setString('emp_id', user['_id']);
+            if (user['name'] != null) await prefs.setString('emp_name', user['name']);
+
+            // Location ID Logic
+            var locationData = data['location'] ?? user['location'];
+
+            if (locationData != null && locationData is List) {
+              await prefs.setString('location_ids', jsonEncode(locationData));
+              print("✅---------------------- Email Login: Location Array Saved: $locationData");
+            } else {
+              print("⚠️-------------------------- Email Login: Location Array not found");
+            }
+          }
           return true;
         }
       }
       return false;
     } catch (e) {
-      print("---------------------------------------Employee Login Error: $e");
+      print("Employee Login Error: $e");
       return false;
     }
   }
@@ -377,6 +402,35 @@ print("------------------------locations $locationIds");
             "isBlocked": false
           }),
       );
+      print("📩🔥---------------------------------------------------------------get location allmini:  Response: ${response.statusCode} - ${response.body}");
+
+      if (response.statusCode == 200) {
+        var data = jsonDecode(response.body);
+        if (data['success'] == true) {
+          return data['data']; // List return kar rahe hain
+        }
+      }
+      return [];
+    } catch (e) {
+      print("--------------------------------------------------------Error fetching locations: $e");
+      return [];
+    }
+  }
+
+  Future<List<dynamic>> getLocationsForEmployee() async {
+    try {
+      if (adminToken == null) await tryAutoLogin(); // Token check
+
+      var response = await http.post(
+        Uri.parse("$baseUrl/admin/location/allMini"),
+        headers: {
+          "Authorization": employeeToken ?? "", // Token zaroori hai
+          "Content-Type": "application/json",
+        },
+          body: jsonEncode({
+            "isBlocked": false
+          }),
+      );
       print("📩🔥---------------------------------------------------------------Location Error:  Response: ${response.statusCode} - ${response.body}");
 
       if (response.statusCode == 200) {
@@ -391,6 +445,8 @@ print("------------------------locations $locationIds");
       return [];
     }
   }
+
+
   Future<List<dynamic>> getDepartments() async {
     try {
       if (adminToken == null) await tryAutoLogin(); // Token check
@@ -405,7 +461,36 @@ print("------------------------locations $locationIds");
             "isBlocked": false
           }),
       );
-      print("📩🔥---------------------------------------------------------------Department Error:  Response: ${response.statusCode} - ${response.body}");
+      print("📩🔥---------------------------------------------------------------get Department :  Response: ${response.statusCode} - ${response.body}");
+
+      if (response.statusCode == 200) {
+        var data = jsonDecode(response.body);
+        if (data['success'] == true) {
+          return data['data']; // List return kar rahe hain
+        }
+      }
+      return [];
+    } catch (e) {
+      print("--------------------------------------------------------Error fetching locations: $e");
+      return [];
+    }
+  }
+
+  Future<List<dynamic>> getDepartmentForEmployee() async {
+    try {
+      if (adminToken == null) await tryAutoLogin(); // Token check
+
+      var response = await http.post(
+        Uri.parse("$baseUrl/admin/department/allMini"),
+        headers: {
+          "Authorization": employeeToken ?? "", // Token zaroori hai
+          "Content-Type": "application/json",
+        },
+          body: jsonEncode({
+            "isBlocked": false
+          }),
+      );
+      print("📩🔥---------------------------------------------------------------get Department :  Response: ${response.statusCode} - ${response.body}");
 
       if (response.statusCode == 200) {
         var data = jsonDecode(response.body);
@@ -465,7 +550,8 @@ print("------------------------locations $locationIds");
         },
       );
 
-      print("👥-------------------------------------------------------------------- Employee List Status: ${response.statusCode}  --${response.body}");
+      print("👥-------------------------------------------------------------------- Get all employees status: ${response.statusCode} ");
+      print("👥-------------------------------------------------------------------- Get all employees body ye dash me b chlta ahi vse bhi : ${response.body}  ");
 
       if (response.statusCode == 200) {
         var data = jsonDecode(response.body);
@@ -526,6 +612,7 @@ print("------------------------locations $locationIds");
       print("🌐 Status: ${response.statusCode}");
       print("---------------------------------------${targetId}");
       print("---------------------------------------${adminToken}");
+      print("👥-------------------------------------------------------------------- Employee List Status: ${response.statusCode}  --${response.body}");
 
       if (response.statusCode == 200) {
         var jsonData = jsonDecode(response.body);
@@ -551,6 +638,7 @@ print("------------------------locations $locationIds");
     required double longitude,
 
     required bool isFromAdminPhone,
+    required String deviceDate,
 
 
   }) async {
@@ -567,8 +655,11 @@ print("------------------------locations $locationIds");
 
         "deviceId": deviceData['id'],
         "deviceModel": deviceData['model'],
-        "isFromAdminPhone": isFromAdminPhone
+        "isFromAdminPhone": isFromAdminPhone,
+        "deviceDate": deviceDate
       };
+      print("📡----------------------------------------------------- deviceID in mark attendnace: $deviceData['id']");
+      print("📡----------------------------------------------------- deviceDatwe: $deviceDate");
 
       print("📡----------------------------------------------------- Sending Attendance Request: Lat: $latitude, Lng: $longitude");
 
@@ -623,7 +714,8 @@ print("------------------------locations $locationIds");
       if (empId != null) {
         body['employeeId'] = empId;
       }
-
+print('employee id=---------------------------------$empId');
+      print("token-----------------------$adminToken");
       var response = await http.post(
           url,
           headers: {
@@ -632,8 +724,8 @@ print("------------------------locations $locationIds");
           },
           body: jsonEncode(body)
       );
-      print("📩📡----------------------------------------------------- Get all Attendance ResponseCode: ${response.statusCode}");
-      print("📩📡-----------------------------------------------------Get all  Attendance Response: ${response.body}");
+      print("📩📡----------------------------------------------------- Get all employees Attendance status: ${response.statusCode}");
+      print("📩📡-----------------------------------------------------Get all employees  Attendance Response: ${response.body}");
       if (response.statusCode == 200) {
         var data = jsonDecode(response.body);
 
@@ -670,7 +762,8 @@ print("------------------------locations $locationIds");
       int total = allEmployees.length;
       int present = presentIds.length;
       int absent = total - present;
-
+      print("📩📡----------------------------------------------------- Get Dashboard attendace  Attendance ResponseCode:");
+      print("📩📡-----------------------------------------------------Get all  Attendance Response");
       return {
         "total": total,
         "present": present,
@@ -737,7 +830,8 @@ print("------------------------locations $locationIds");
       SharedPreferences prefs = await SharedPreferences.getInstance();
       String? token = prefs.getString('token');
 
-      print("📦--------------------------------- Sending Data: $locationId");
+      print("📦---------------------------------Location id: $locationId");
+      print("📦--------------------------------- department id : $departmentId");
       print("-------------------------Payload: {employeeId: $empId, locationId: $locationId, month: $month}");
 
       var response = await http.post(
@@ -761,10 +855,11 @@ print("------------------------locations $locationIds");
         var jsonResponse = jsonDecode(response.body);
         if (jsonResponse['success'] == true) {
           var data = jsonResponse['data'];
+          return jsonDecode(response.body);
           // API array bhej raha hai, humein pehla object chahiye
-          if (data is List && data.isNotEmpty) {
-            return data[0];
-          }
+          // if (data is List && data.isNotEmpty) {
+          //   return data[0];
+          // }
         }
       }
       return null;
@@ -831,7 +926,7 @@ print("------------------------locations $locationIds");
   //     return null;
   //   }
   // }
-  Future<String?> fetchUserLocationId(String empId) async {
+  Future<List<dynamic>?> fetchUserLocationId(String empId) async {
     try {
       var url = Uri.parse("$baseUrl/employee/get/$empId");
       SharedPreferences prefs = await SharedPreferences.getInstance();
@@ -851,8 +946,9 @@ print("------------------------locations $locationIds");
         var data = jsonDecode(response.body);
         if (data['success'] == true) {
           // Data structure check karo
-          var empData = data['data'] ?? data['employee'];
-          return empData['locationId'];
+          if (data['location'] != null && data['location'] is List) {
+            return data['location'];
+          }
         }
       }
     } catch (e) {
@@ -864,7 +960,7 @@ print("------------------------locations $locationIds");
   // ==========================================
   // 2. HISTORY: MONTHLY REPORT
   // ==========================================
-  Future<Map<String, dynamic>?> getEmployeeOwnHistory(String empId, String month, String locationId) async {
+  Future<Map<String, dynamic>?> getEmployeeOwnHistory(String empId, String month, String locationId,String departmentId) async {
     try {
       var url = Uri.parse("$baseUrl/admin/monthlyEmployeeReport");
       SharedPreferences prefs = await SharedPreferences.getInstance();
@@ -883,10 +979,14 @@ print("------------------------locations $locationIds");
         body: jsonEncode({
           "employeeId": empId,
           "month": month,
-          "locationId": locationId // ✅ Sending Location ID
+          "locationId": locationId, // ✅ Sending Location ID
+          "departmentId": departmentId
         }),
       );
-print("------------------------------------------------$locationId");
+print("------------------------------dept------------------$departmentId");
+      print("📡-------------------------------------- employe monthly report emplyee side Response Code: ${response.statusCode}");
+      print("----------------------------------------------📩employe monthly report emplyee side Response Body: ${response.body}"); // Debugging ke liye hata diya hai taaki console na bhare
+
       if (response.statusCode == 200) {
         var jsonResponse = jsonDecode(response.body);
         if (jsonResponse['success'] == true) {
@@ -1061,8 +1161,9 @@ print("------------------------------------------------$locationId");
           "locationId": locationId
         }),
       );
-      print("🔍------------------------------------------------ By date and location Status: ${response.statusCode}");
-      print("🔍------------------------------------------------ By date and location response: ${response.body}"); // Debugging ke liye
+      print("🔍------------------------------------------------ date: ${date}, location : $locationId");
+      print("🔍------------------------------------------------ get attendance By date and location Status: ${response.statusCode}");
+      print("🔍------------------------------------------------ get attendance By date and location response: ${response.body}"); // Debugging ke liye
       if (response.statusCode == 200) {
         var data = jsonDecode(response.body);
         // Maan ke chal rahe hain response { success: true, data: [...] } hai
@@ -1071,7 +1172,7 @@ print("------------------------------------------------$locationId");
         return [];
       }
     } catch (e) {
-      print("Error fetching daily report: $e");
+      print("------------Error fetching daily report: $e");
       return [];
     }
   }
@@ -1079,11 +1180,17 @@ print("------------------------------------------------$locationId");
     try {
       var url = Uri.parse("$baseUrl/admin/employeeAttendanceByDate");
       SharedPreferences prefs = await SharedPreferences.getInstance();
-      String? token = prefs.getString('token');
 
-      // 🔴 Backend Logic: locationId required hai, isliye bhej rahe hain
+      // 🔴 FIX: Token key confirm karein. Usually 'saved_token' use ho raha tha.
+      String? token = prefs.getString('saved_token') ?? prefs.getString('token');
+
+      if (token == null) {
+        print("❌------------------------ Token Not Found");
+        return null;
+      }
+
       var bodyData = {
-        "locationId": locationId,
+        "locationId": locationId, // Make sure ye valid MongoDB ID ho
         "employeeId": empId,
         "date": date
       };
@@ -1096,15 +1203,22 @@ print("------------------------------------------------$locationId");
         },
         body: jsonEncode(bodyData),
       );
-      print("🔍------------------------------------------------ dashboard data: ${response.statusCode}");
-      print("🔍------------------------------------------------Dashboard: ${response.body}");
+
+      print("🔍--------------------------- Dashboard employee API Response Code: ${response.statusCode}");
+      print("🔍-------------------------------Dashboard employee  API Response Body: ${response.body}");
+
       if (response.statusCode == 200) {
         var jsonResponse = jsonDecode(response.body);
+
+        // 🔴 FIX: Check success structure
         if (jsonResponse['success'] == true) {
-          // Response list hai, humein pehla employee chahiye
-          List<dynamic> dataList = jsonResponse['data'] ?? [];
-          if (dataList.isNotEmpty) {
-            return dataList[0];
+          // Data list hai ya map, safe check lagayein
+          var responseData = jsonResponse['data'];
+
+          if (responseData is List && responseData.isNotEmpty) {
+            return responseData[0]; // List ka pehla item (Attendance Object)
+          } else if (responseData is Map<String, dynamic>) {
+            return responseData; // Agar direct object hai
           }
         }
       }
@@ -1114,7 +1228,6 @@ print("------------------------------------------------$locationId");
       return null;
     }
   }
-
 
   // Face Update Function
   Future<bool> updateEmployeeFace(String id, List<double> embedding) async {
@@ -1183,7 +1296,8 @@ print("------------------------------------------------$locationId");
     required List<double> faceEmbedding,
     required double latitude,
     required double longitude,
-    bool isFromAdminPhone = false,
+    required bool isFromAdminPhone,
+    required String deviceDate,
   }) async {
     try {
       // 🔴 Endpoint changed to /forceCheckOut
@@ -1204,23 +1318,88 @@ print("------------------------------------------------$locationId");
           "latitude": latitude,
           "longitude": longitude,
           "isFromAdminPhone": isFromAdminPhone,
-          "forceCheckOut": true
+          "forceCheckOut": true,
+          "deviceDate": deviceDate
         }),
       );
       debugPrint("-----------------------------------------Force checkout Done: ${response.statusCode}");
       debugPrint("-----------------------------------------Force checkout Done: ${response.body}");
       var data = jsonDecode(response.body);
 
-      if (response.statusCode == 200 || response.statusCode == 201) {
-        return {'success': true, 'message': data['message'], 'data': data['data']};
+      if (response.statusCode == 200 || response.statusCode == 201 && data['success'] == true) {
+        return {
+          "success": data['success'] ?? false,
+          "message": data['message'] ?? "Unknown",
+          "data": data['data'] // User details (Name, Photo etc.)
+        };
       } else {
-        return {'success': false, 'message': data['message'] ?? "Force Checkout Failed"};
+        return {"success": false, "message": "Server Error: ${response.statusCode}"};
       }
     } catch (e) {
-      return {'success': false, 'message': "Server Error: $e"};
+      print("🔥-------------------------------------- Mark Attendance Error: $e");
+      return {"success": false, "message": "Connection Error"};
     }
   }
+
+
+  Future<Map<String, dynamic>?> fetchUserProfile(String empId) async {
+    try {
+      SharedPreferences prefs = await SharedPreferences.getInstance();
+      String? token = prefs.getString('token') ?? prefs.getString('saved_token');
+
+      if (token == null) return null;
+
+      var url = Uri.parse("$baseUrl/employee/get/$empId");
+
+      var response = await http.get(
+        url,
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": token,
+        },
+      );
+      debugPrint("-----------------------------------------fetchUserProfile  Done: ${response.statusCode}");
+      debugPrint("-----------------------------------------fetchUserProfile Done: ${response.body}");
+      if (response.statusCode == 200) {
+        var json = jsonDecode(response.body);
+        if (json['success'] == true) {
+          // Pura data object return kar rahe hain (isme location aur department dono hote hain)
+          return json['data'];
+        }
+      }
+    } catch (e) {
+      print("Profile Fetch Error: $e");
+    }
+    return null;
+  }
+
+
+
+
+  Future<bool> checkAdminDevice(String deviceId) async {
+    try {
+      final response = await http.post(
+        Uri.parse("$baseUrl/admin/checkAdminDevice"),
+        headers: {"Content-Type": "application/json"},
+        body: jsonEncode({"deviceId": deviceId}),
+      );
+      debugPrint("-----------------------------------------My  id: ${deviceId}");
+      debugPrint("-----------------------------------------Admin id is   Done: ${response.statusCode}");
+      debugPrint("-----------------------------------------Admin id is Done: ${response.body}");
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        return data['isAdmin'] ?? false;
+      }
+      return false;
+    } catch (e) {
+      return false;
+    }
+  }
+
+
+
 }
+
 
 
 

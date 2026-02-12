@@ -252,16 +252,22 @@ class _EmployeeListScreenState extends State<EmployeeListScreen> {
     String firstLetter = name.isNotEmpty ? name[0].toUpperCase() : "?";
 
     // Location Logic (Fixed for Array)
+    // String locationId;
+    //
+    // if (emp['locations'] != null && emp['locations'] is List && emp['locations'].isNotEmpty) {
+    //   locationId = emp['locations'][0]['_id'] ?? ""; // Array se ID nikala
+    // } else if (emp['locationId'] is String) {
+    //   locationId = emp['locationId'];
+    // } else if (emp['location'] is Map) {
+    //   locationId = emp['location']['_id'] ?? "";
+    // }
     String locationId = "";
-
-    if (emp['locations'] != null && emp['locations'] is List && emp['locations'].isNotEmpty) {
-      locationId = emp['locations'][0]['_id'] ?? ""; // Array se ID nikala
-    } else if (emp['locationId'] is String) {
-      locationId = emp['locationId'];
-    } else if (emp['location'] is Map) {
-      locationId = emp['location']['_id'] ?? "";
+    if (emp['locations'] != null && emp['locations'] is List && (emp['locations'] as List).isNotEmpty) {
+      var firstLoc = emp['locations'][0];
+      locationId = (firstLoc is Map) ? (firstLoc['_id']?.toString() ?? "") : "";
+    } else if (emp['locationId'] != null) {
+      locationId = emp['locationId'].toString();
     }
-
     String departmentId = "";
     var rawDept = emp['departmentId'];
     if (rawDept is String) {
