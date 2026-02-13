@@ -537,26 +537,61 @@ print("------------------------locations $locationIds");
 
 
 
-  Future<List<dynamic>> getAllEmployees() async {
-    try {
-      if (adminToken == null) await tryAutoLogin();
+  // Future<List<dynamic>> getAllEmployees() async {
+  //   try {
+  //     if (adminToken == null) await tryAutoLogin();
+  //
+  //     // 🔴 URL Check kar lena (Shayad '/admin/employee/all' ho)
+  //     var response = await http.post(
+  //       Uri.parse("$baseUrl/admin/employee/all"),
+  //       headers: {
+  //         "Authorization": adminToken ?? "",
+  //         "Content-Type": "application/json",
+  //       },
+  //     );
+  //
+  //     print("👥-------------------------------------------------------------------- Get all employees status: ${response.statusCode} ");
+  //     print("👥-------------------------------------------------------------------- Get all employees body ye dash me b chlta ahi vse bhi : ${response.body}  ");
+  //
+  //     if (response.statusCode == 200) {
+  //       var data = jsonDecode(response.body);
+  //       if (data['success'] == true) {
+  //         return data['data']; // Ye wo List return karega jo tumne bheji
+  //       }
+  //     }
+  //     return [];
+  //   } catch (e) {
+  //     print("Error fetching employees: $e");
+  //     return [];
+  //   }
+  // }
 
-      // 🔴 URL Check kar lena (Shayad '/admin/employee/all' ho)
+  // Dashboard pe hum ise call nahi karenge, sirf Employee List screen pe karenge.
+  Future<List<dynamic>> getAllEmployees({int page = 1, int limit = 1000}) async {
+    try {
+      // Token Logic
+      if (adminToken == null) {
+        SharedPreferences prefs = await SharedPreferences.getInstance();
+        adminToken = prefs.getString('saved_token');
+      }
+
+      // Query Params: ?page=1&limit=10
+      var url = Uri.parse("$baseUrl/admin/employee/all?page=$page&limit=$limit");
+
       var response = await http.post(
-        Uri.parse("$baseUrl/admin/employee/all"),
+        url,
         headers: {
           "Authorization": adminToken ?? "",
           "Content-Type": "application/json",
         },
       );
-
       print("👥-------------------------------------------------------------------- Get all employees status: ${response.statusCode} ");
-      print("👥-------------------------------------------------------------------- Get all employees body ye dash me b chlta ahi vse bhi : ${response.body}  ");
+          print("👥-------------------------------------------------------------------- Get all employees body ye dash me b chlta ahi vse bhi : ${response.body}  ");
 
       if (response.statusCode == 200) {
         var data = jsonDecode(response.body);
         if (data['success'] == true) {
-          return data['data']; // Ye wo List return karega jo tumne bheji
+          return data['data'] ?? [];
         }
       }
       return [];
@@ -565,6 +600,11 @@ print("------------------------locations $locationIds");
       return [];
     }
   }
+
+
+
+
+
   Future<Map<String, String>> _getDeviceInfo() async {
     DeviceInfoPlugin deviceInfo = DeviceInfoPlugin();
     String deviceId = "Unknown";
@@ -848,6 +888,7 @@ print('employee id=---------------------------------$empId');
         }),
       );
 
+      print("📡-------------------------------------- tokenne: ${adminToken}");
       print("📡-------------------------------------- monthly Response Code: ${response.statusCode}");
       print("----------------------------------------------📩 Response Body: ${response.body}"); // Debugging ke liye hata diya hai taaki console na bhare
 
@@ -869,63 +910,7 @@ print('employee id=---------------------------------$empId');
     }
   }
 
-  // 🔴 SPECIALIZED FUNCTION: EMPLOYEE APNI HISTORY KHUD DEKH RAHA HAI
-  // Future<Map<String, dynamic>?> getEmployeeOwnHistory(String empId, String month) async {
-  //   try {
-  //     // ⚠️ IMPORTANT:
-  //     // Agar backend par Admin aur Employee ka URL same hai, toh ye line aise hi rehne do.
-  //     // Agar Employee ka alag route hai (e.g., /employee/getReport), toh yahan change karlena.
-  //     // Filhal main maan ke chal raha hu ki URL /admin/ wala hi hai lekin Token Employee ka jayega.
-  //
-  //     // OPTION A: Agar same URL hai
-  //     // var url = Uri.parse("$baseUrl/admin/monthlyEmployeeReport");
-  //
-  //     // OPTION B (Most Likely): Employee ka alag route hoga
-  //     var url = Uri.parse("$baseUrl/admin/monthlyEmployeeReport");
-  //
-  //     SharedPreferences prefs = await SharedPreferences.getInstance();
-  //     String? token = prefs.getString('token');
-  //
-  //     // 🔴 STEP 1: Employee wala Token nikalo (Jo login karte waqt save kiya tha)
-  //     // String? token = prefs.getString('employeeToken');
-  //
-  //     if (employeeToken == null) {
-  //       print("❌ ----------------------------------------------------------Error: Employee Token not found.");
-  //       return null;
-  //     }
-  //
-  //     print("🚀 ----------------------------------------------------------FETCHING OWN HISTORY: $url");
-  //     print("👤---------------------------------------------------------- Employee ID: $empId");
-  //     print("📅 ----------------------------------------------------------Month: $month");
-  //     print("🔑------------------------------------------ his---------------- Token: $employeeToken");
-  //
-  //     var response = await http.post(
-  //       url,
-  //       headers: {
-  //         "Content-Type": "application/json",
-  //         "Authorization": "$token", // 🔴 Employee Token Bheja
-  //       },
-  //       body: jsonEncode({
-  //         "employeeId": empId,
-  //         "month": month
-  //       }),
-  //     );
-  //
-  //     print("📡---------------------------------------------------------- Status Code: ${response.statusCode}");
-  //     print("📩 ----------------------------------------------------------Body: ${response.body}");
-  //
-  //     if (response.statusCode == 200) {
-  //       var data = jsonDecode(response.body);
-  //       if (data['success'] == true && data['data'] != null && (data['data'] as List).isNotEmpty) {
-  //         return data['data'][0];
-  //       }
-  //     }
-  //     return null;
-  //   } catch (e) {
-  //     print("❌ ----------------------------------------------------------API Error: $e");
-  //     return null;
-  //   }
-  // }
+
   Future<List<dynamic>?> fetchUserLocationId(String empId) async {
     try {
       var url = Uri.parse("$baseUrl/employee/get/$empId");
@@ -960,15 +945,61 @@ print('employee id=---------------------------------$empId');
   // ==========================================
   // 2. HISTORY: MONTHLY REPORT
   // ==========================================
-  Future<Map<String, dynamic>?> getEmployeeOwnHistory(String empId, String month, String locationId,String departmentId) async {
+//   Future<Map<String, dynamic>?> getEmployeeOwnHistory(String empId, String month, String locationId,String departmentId) async {
+//     try {
+//       var url = Uri.parse("$baseUrl/admin/monthlyEmployeeReport");
+//       SharedPreferences prefs = await SharedPreferences.getInstance();
+//       String? token = prefs.getString('token');
+//
+//       if (token == null) return null;
+//
+//       print("📦 Fetching History -> ID: $empId, Loc: $locationId, Month: $month");
+//
+//       var response = await http.post(
+//         url,
+//         headers: {
+//           "Content-Type": "application/json",
+//           "Authorization": "$token",
+//         },
+//         body: jsonEncode({
+//           "employeeId": empId,
+//           "month": month,
+//           "locationId": locationId, // ✅ Sending Location ID
+//           "departmentId": departmentId
+//         }),
+//       );
+// print("------------------------------dept------------------$departmentId");
+//       print("📡-------------------------------------- employe monthly report emplyee side Response Code: ${response.statusCode}");
+//       print("----------------------------------------------📩employe monthly report emplyee side Response Body: ${response.body}"); // Debugging ke liye hata diya hai taaki console na bhare
+//
+//       if (response.statusCode == 200) {
+//         var jsonResponse = jsonDecode(response.body);
+//         if (jsonResponse['success'] == true) {
+//           var listData = jsonResponse['data'] ?? jsonResponse['employees'];
+//           if (listData != null && listData is List && listData.isNotEmpty) {
+//             return listData[0];
+//           }
+//         }
+//       } else {
+//         print("❌ API Error: ${response.body}");
+//       }
+//       return null;
+//     } catch (e) {
+//       print("API Exception: $e");
+//       return null;
+//     }
+//   }
+
+
+
+  // 🔴 Updated: Returns Full JSON (taaki monthSummary bhi mile)
+  Future<Map<String, dynamic>?> getEmployeeOwnHistory(String empId, String month, String locationId, String departmentId) async {
     try {
       var url = Uri.parse("$baseUrl/admin/monthlyEmployeeReport");
       SharedPreferences prefs = await SharedPreferences.getInstance();
-      String? token = prefs.getString('token');
+      String? token = prefs.getString('token'); // Employee Token
 
       if (token == null) return null;
-
-      print("📦 Fetching History -> ID: $empId, Loc: $locationId, Month: $month");
 
       var response = await http.post(
         url,
@@ -979,24 +1010,16 @@ print('employee id=---------------------------------$empId');
         body: jsonEncode({
           "employeeId": empId,
           "month": month,
-          "locationId": locationId, // ✅ Sending Location ID
+          "locationId": locationId,
           "departmentId": departmentId
         }),
       );
-print("------------------------------dept------------------$departmentId");
+      print("------------------------------dept------------------$departmentId");
       print("📡-------------------------------------- employe monthly report emplyee side Response Code: ${response.statusCode}");
       print("----------------------------------------------📩employe monthly report emplyee side Response Body: ${response.body}"); // Debugging ke liye hata diya hai taaki console na bhare
 
       if (response.statusCode == 200) {
-        var jsonResponse = jsonDecode(response.body);
-        if (jsonResponse['success'] == true) {
-          var listData = jsonResponse['data'] ?? jsonResponse['employees'];
-          if (listData != null && listData is List && listData.isNotEmpty) {
-            return listData[0];
-          }
-        }
-      } else {
-        print("❌ API Error: ${response.body}");
+        return jsonDecode(response.body); // 👈 Full JSON bhej rahe hain ab
       }
       return null;
     } catch (e) {
@@ -1009,95 +1032,6 @@ print("------------------------------dept------------------$departmentId");
 
 
 
-
-
-  // this changed
-  // 🔴 UPDATED: Accepts locationId now
-  // Future<Map<String, dynamic>?> getEmployeeOwnHistory(String empId, String month) async {
-  //   try {
-  //     var url = Uri.parse("$baseUrl/admin/monthlyEmployeeReport");
-  //
-  //     SharedPreferences prefs = await SharedPreferences.getInstance();
-  //     String? token = prefs.getString('token');
-  //
-  //     if (token == null || token.isEmpty) {
-  //       print("❌❌------------------------------------------------ Token Missing");
-  //       return null;
-  //     }
-  //
-  //     // print("📦 Fetching for: $empId, Loc: $locationId, Month: $month");
-  //
-  //     var response = await http.post(
-  //       url,
-  //       headers: {
-  //         "Content-Type": "application/json",
-  //         "Authorization": "$employeeToken",
-  //       },
-  //       body: jsonEncode({
-  //         "employeeId": empId,
-  //         "month": month,
-  //
-  //       }),
-  //     );
-  //     print("📡--------------------------------------getEmployeeOwnHistory Response Code: ${response.statusCode}");
-  //     print("----------------------------------------------📩getEmployeeOwnHistory Response Body: ${response.body}");
-  //     if (response.statusCode == 200) {
-  //       var jsonResponse = jsonDecode(response.body);
-  //
-  //       if (jsonResponse['success'] == true) {
-  //         var listData = jsonResponse['data'] ?? jsonResponse['employees'];
-  //         if (listData != null && listData is List && listData.isNotEmpty) {
-  //           return listData[0];
-  //         }
-  //       }
-  //     } else {
-  //       print("❌------------------------------------------------ API Error: ${response.body}");
-  //     }
-  //     return null;
-  //   } catch (e) {
-  //     print("API Exception: $e");
-  //     return null;
-  //   }
-  // }
-// 🔴 Check if Face Already Exists (Pre-check)
-// 🔴 Check if Face Already Exists (With Admin Token)
-//   Future<int> checkFaceExistence(List<double> faceEmbedding) async {
-//     try {
-//       var url = Uri.parse("$baseUrl/admin/employee/create");
-//
-//       // 1. Token nikalo storage se
-//       SharedPreferences prefs = await SharedPreferences.getInstance();
-//       String? saved_token = prefs.getString('saved_token'); // Admin ka token yahan save hota hai
-//
-//       print("🔍 Checking Face with Token: $saved_token");
-//
-//       var response = await http.post(
-//         url,
-//         headers: {
-//           "Content-Type": "application/json",
-//           // 🔴 HEADER MEIN TOKEN ADD KIYA
-//           "Authorization": "$adminToken",
-//         },
-//         body: jsonEncode({
-//           "faceEmbedding": faceEmbedding,
-//         }),
-//       );
-//
-//       print("🔍------------------------------------------------ Face Check Status: ${response.statusCode}");
-//       print("🔍------------------------------------------------ Response: ${response.body}"); // Debugging ke liye
-//       var data = jsonDecode(response.body);
-//
-//       if (data['status'] != null) {
-//         return data['status']; // ✅ Ye 422 return karega
-//       } else {
-//         return response.statusCode; // Fallback
-//       }
-//
-//     } catch (e) {
-//       print("------------------------------------------------Face Check Error: $e");
-//       return 500; // Error aya to safe side form khol denge
-//     }
-//   }
 // 🔴 Change return type to Map (Code + Message ke liye)
   Future<Map<String, dynamic>> checkFaceExistence(List<double> faceEmbedding) async {
     try {
@@ -1176,6 +1110,51 @@ print("------------------------------dept------------------$departmentId");
       return [];
     }
   }
+
+
+
+  //
+  // // 🔴 UPDATED FOR PAGINATION
+  // Future<List<dynamic>> getAttendanceByDateAndLocation(
+  //     String date, String locationId, {int page = 1, int limit = 10}) async {
+  //   try {
+  //     var url = Uri.parse("$baseUrl/admin/employeeAttendanceByDate");
+  //
+  //     SharedPreferences prefs = await SharedPreferences.getInstance();
+  //
+  //     // Body me page aur limit add kar diya
+  //     var bodyData = {
+  //       "date": date,
+  //       "locationId": locationId,
+  //       "startpoint": page,   // 👈 New
+  //       "limit": limit  // 👈 New
+  //     };
+  //
+  //     var response = await http.post(
+  //       url,
+  //       headers: {
+  //         "Content-Type": "application/json",
+  //         "Authorization": "$adminToken",
+  //       },
+  //       body: jsonEncode(bodyData),
+  //     );
+  //     print("🔍------------------------------------------------ date: ${date}, location : $locationId");
+  //         print("🔍------------------------------------------------ get attendance By date and location Status: ${response.statusCode}");
+  //         print("🔍------------------------------------------------ get attendance By date and location response: ${response.body}"); // Debugging ke liye
+  //     if (response.statusCode == 200) {
+  //       var data = jsonDecode(response.body);
+  //       return data['data'] ?? [];
+  //     } else {
+  //       return [];
+  //     }
+  //   } catch (e) {
+  //     print("Error fetching daily report: $e");
+  //     return [];
+  //   }
+  // }
+  //
+
+
   Future<Map<String, dynamic>?> getDailyAttendance(String empId, String locationId, String date) async {
     try {
       var url = Uri.parse("$baseUrl/admin/employeeAttendanceByDate");
@@ -1263,32 +1242,81 @@ print("------------------------------dept------------------$departmentId");
 
 
 
-  Future<List<dynamic>> getHolidays() async {
+  // Future<List<dynamic>> getHolidays() async {
+  //   try {
+  //     var url = Uri.parse("$baseUrl/admin/holiday/all");
+  //     var response = await http.post(url, headers: {
+  //       "Authorization": adminToken ?? "",
+  //       "Content-Type": "application/json"
+  //     });
+  //     debugPrint("-----------------------------------------Holiday Done: ${response.statusCode}");
+  //     debugPrint("-----------------------------------------Holiday Done: ${response.body}");
+  //     if (response.statusCode == 200) {
+  //       var data = jsonDecode(response.body);
+  //       // Agar response { success: true, data: [...] } format me hai
+  //       if (data is Map && data.containsKey('data')) {
+  //         return data['data'];
+  //       }
+  //       // Agar direct list hai
+  //       else if (data is List) {
+  //         return data;
+  //       }
+  //     }
+  //   } catch (e) {
+  //     print("Holiday Fetch Error: $e");
+  //   }
+  //   return [];
+  // }
+
+
+// ---------------------------------------------------------
+  Future<List<dynamic>> getHolidays({String? financialYearId}) async {
     try {
-      var url = Uri.parse("$baseUrl/admin/holiday/all");
-      var response = await http.post(url, headers: {
-        "Authorization": adminToken ?? "",
-        "Content-Type": "application/json"
-      });
+      // URL Builder
+      String urlStr = "$baseUrl/admin/holiday/all";
+
+      // Agar backend URL parameters (?id=...) expect kar raha hai:
+      if (financialYearId != null) {
+        urlStr += "?financialYearId=$financialYearId";
+      }
+
+      var url = Uri.parse(urlStr);
+
+      // Agar backend BODY mein JSON expect kar raha hai (POST request ke liye common):
+      Map<String, dynamic> bodyParams = {};
+      if (financialYearId != null) {
+        bodyParams['financialYearId'] = financialYearId;
+      }
+
+      var response = await http.post(
+        url,
+        headers: {
+          "Authorization": adminToken ?? "",
+          "Content-Type": "application/json"
+        },
+        // Body bhej rahe hain taaki agar backend body se ID uthaye to mil jaye
+        body: bodyParams.isNotEmpty ? jsonEncode(bodyParams) : null,
+      );
+
       debugPrint("-----------------------------------------Holiday Done: ${response.statusCode}");
       debugPrint("-----------------------------------------Holiday Done: ${response.body}");
+      // debugPrint("Holiday Body: ${response.body}");
+
       if (response.statusCode == 200) {
         var data = jsonDecode(response.body);
-        // Agar response { success: true, data: [...] } format me hai
+
+        // Response format handle karna
         if (data is Map && data.containsKey('data')) {
           return data['data'];
-        }
-        // Agar direct list hai
-        else if (data is List) {
+        } else if (data is List) {
           return data;
         }
       }
     } catch (e) {
-      print("Holiday Fetch Error: $e");
+      debugPrint("Holiday Fetch Error: $e");
     }
     return [];
   }
-
 
 
   // 🔴 FORCE CHECKOUT API
@@ -1396,7 +1424,30 @@ print("------------------------------dept------------------$departmentId");
     }
   }
 
+  Future<List<dynamic>> getFinancialYears() async {
+    try {
+      var url = Uri.parse("$baseUrl/admin/financialYear/allMini");
 
+      // Usually fetch ke liye GET hota hai, agar POST chahiye to .get ko .post kar dena
+      var response = await http.post(url, headers: {
+        "Authorization": adminToken ?? "",
+        "Content-Type": "application/json"
+      });
+
+      debugPrint("FY Response: ${response.statusCode}");
+      debugPrint("-----------------------------------------Financial year  Done: ${response.statusCode}");
+      debugPrint("-----------------------------------------Financial year Done: ${response.body}");
+      if (response.statusCode == 200) {
+        var data = jsonDecode(response.body);
+        if (data is Map && data['success'] == true) {
+          return data['data'] ?? [];
+        }
+      }
+    } catch (e) {
+      debugPrint("Financial Year Fetch Error: $e");
+    }
+    return [];
+  }
 
 }
 

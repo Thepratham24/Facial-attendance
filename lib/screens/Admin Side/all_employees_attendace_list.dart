@@ -8,6 +8,7 @@ import 'package:intl/intl.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import '../../services/api_service.dart';
+import 'admin_dashboard_screen.dart';
 import 'attendance_history_screen.dart';
 
 class AllEmployeesAttendanceList extends StatefulWidget {
@@ -140,31 +141,50 @@ class _AllEmployeesAttendanceListState
 
         var attendance = item['attendance'];
 
-        int status = 2; // Default Absent
+        int status = 0; // Default Absent
         String? checkIn;
         String? checkOut;
         String workTime = "";
         bool isLate = false;
-        if (attendance != null && attendance is Map) {
+        if (attendance == null || attendance is! Map || attendance.isEmpty) {
+          status = 2; // Absent
+          absentCount++;
+        }
+
+       else {
           // 🔴 TRUST BACKEND COMPLETELY
           status = attendance['status'] ?? 2;
           checkIn = attendance['checkInTime'] ?? attendance['punchIn'];
           checkOut = attendance['checkOutTime'] ?? attendance['punchOut'];
           workTime = attendance['workingHours'] ?? attendance['duration'] ?? "";
           isLate = attendance['isLate'] == true;
-        }
-        if (isLate || status == 3) {
-          lateCount++;
-          // Late log technically present hote hain, toh present count bhi badhana pad sakta hai
-          // depend karta hai aap dashboard pe kaise dikhana chahte ho.
-        }
-        // 🔴 COUNTING LOGIC (Purely based on Status)
-        if (status == 1) {
-          presentCount++; // Present or Half Day
-        } else if (status == 4) {
-          halfDayCount++; // Late
-        } else {
-          absentCount++; // Absent (2) or Excused (5)
+
+        // if (isLate || status == 3) {
+        //   lateCount++;
+        //   // Late log technically present hote hain, toh present count bhi badhana pad sakta hai
+        //   // depend karta hai aap dashboard pe kaise dikhana chahte ho.
+        // }
+        // // 🔴 COUNTING LOGIC (Purely based on Status)
+        // if (status == 1) {
+        //   presentCount++; // Present or Half Day
+        // } else if (status == 4) {
+        //   halfDayCount++; // Late
+        // } else {
+        //   absentCount++; // Absent (2) or Excused (5)
+        // }
+
+          if (status == 1) {
+            presentCount++; // Sirf Green wala Present
+          }
+          else if (status == 3) {
+            lateCount++; // Pratham yahan count hoga (Late Bucket)
+          }
+          else if (status == 4) {
+            halfDayCount++; // Half Day Bucket
+          }
+          else {
+            absentCount++; // Status 2 or 5
+          }
         }
 
         temp.add({
@@ -649,7 +669,7 @@ class _AllEmployeesAttendanceListState
               ? const Center(
                   child: CircularProgressIndicator(color: Color(0xFF2E3192)))
               : RefreshIndicator(
-                  onRefresh: () => _fetchData(isBackground: false),
+                  onRefresh: () => _fetchData(isBackground: true),
                   color: const Color(0xFF2E3192),
                   edgeOffset: 340,
                   child: displayList.isEmpty
@@ -717,7 +737,33 @@ class _AllEmployeesAttendanceListState
                       Row(
                         children: [
                           GestureDetector(
-                            onTap: () => Navigator.pop(context),
+                            onTap: () {
+                              // Agar hum AdminDashboard ke andar hain (Bottom Nav ke through)
+                              // To humein bas Tab change karna hai, pop nahi karna.
+                              // Lekin agar aap chahte hain ki ye "Back" jaisa behave kare:
+
+                              // Check if we can pop
+                              if (Navigator.canPop(context)) {
+                                Navigator.pop(context);
+                              } else {
+                                // Agar pop nahi kar sakte (matlab ye root tab hai), to Home Tab pe switch karwao
+                                // Iske liye hum ek global key ya callback use kar sakte hain,
+                                // Par simple tareeka ye hai ki AdminDashboard ko rebuild karwaein 0 index ke sath.
+
+                                // OPTION 1: Agar ye screen bottom nav ka hissa hai (Jo ki hai)
+                                // To yahan back button ki zaroorat hi nahi honi chahiye (Design Wise).
+                                // Lekin agar aapko button rakhna hai, to use dabaane par "Home" tab select hona chahiye.
+
+                                // Iske liye humein AdminDashboard me ek controller banana padega, jo abhi complex ho jayega.
+
+                                // ✅ SIMPLEST FIX:
+                                // AdminDashboard ko dobara pushReplacement kar do (0 index ke sath)
+                                Navigator.pushReplacement(
+                                    context,
+                                    MaterialPageRoute(builder: (context) => const AdminDashboard())
+                                );
+                              }
+                            },
                             child: Container(
                               width: 42,
                               height: 42,
@@ -1156,7 +1202,7 @@ class _AllEmployeesAttendanceListState
                               mainAxisSize: MainAxisSize.min,
                               children: [
                                 // 🔴 Agar Late hai, to Red Badge dikhao
-                                if (isLate)
+                                if (isLate && status!=3)
                                   Container(
                                       margin: const EdgeInsets.only(right: 5),
                                       padding: const EdgeInsets.symmetric(

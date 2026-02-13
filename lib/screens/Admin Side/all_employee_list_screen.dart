@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 
 import '../../services/api_service.dart';
 import '../../main.dart'; // Access global variables if needed
+import 'admin_dashboard_screen.dart';
 import 'attendance_history_screen.dart';
 import 'face_capture_update_screen.dart';
 
@@ -177,7 +178,33 @@ class _EmployeeListScreenState extends State<EmployeeListScreen> {
                   Row(
                     children: [
                       GestureDetector(
-                        onTap: () => Navigator.pop(context),
+                        onTap: () {
+                          // Agar hum AdminDashboard ke andar hain (Bottom Nav ke through)
+                          // To humein bas Tab change karna hai, pop nahi karna.
+                          // Lekin agar aap chahte hain ki ye "Back" jaisa behave kare:
+
+                          // Check if we can pop
+                          if (Navigator.canPop(context)) {
+                            Navigator.pop(context);
+                          } else {
+                            // Agar pop nahi kar sakte (matlab ye root tab hai), to Home Tab pe switch karwao
+                            // Iske liye hum ek global key ya callback use kar sakte hain,
+                            // Par simple tareeka ye hai ki AdminDashboard ko rebuild karwaein 0 index ke sath.
+
+                            // OPTION 1: Agar ye screen bottom nav ka hissa hai (Jo ki hai)
+                            // To yahan back button ki zaroorat hi nahi honi chahiye (Design Wise).
+                            // Lekin agar aapko button rakhna hai, to use dabaane par "Home" tab select hona chahiye.
+
+                            // Iske liye humein AdminDashboard me ek controller banana padega, jo abhi complex ho jayega.
+
+                            // ✅ SIMPLEST FIX:
+                            // AdminDashboard ko dobara pushReplacement kar do (0 index ke sath)
+                            Navigator.pushReplacement(
+                                context,
+                                MaterialPageRoute(builder: (context) => const AdminDashboard())
+                            );
+                          }
+                        },
                         child: Container(
                           padding: const EdgeInsets.all(12),
                           decoration: BoxDecoration(
